@@ -1,0 +1,47 @@
+# Video Editing Copilot Agent
+
+*.pyc
+__pycache__/
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+
+# Environment
+.env
+.venv/
+venv/
+ENV/
+myenv/
+
+# Temporary files
+temp/
+*.tmp
+*.temp
+
+# Output files
+output/
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.wav
+*.jpg
+*.png
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Models
+models/
+*.model
+*.bin

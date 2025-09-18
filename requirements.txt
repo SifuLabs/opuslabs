@@ -1,0 +1,17 @@
+# Core requirements
+google-generativeai>=0.3.0
+moviepy>=1.0.3
+opencv-python>=4.8.0
+numpy>=1.24.0
+requests>=2.31.0
+python-dotenv>=1.0.0
+pillow>=10.0.0
+ffmpeg-python>=0.2.0
+yt-dlp>=2023.7.6
+nltk>=3.8
+textstat>=0.7.0
+
+# Optional requirements (install separately if needed)
+# whisper>=1.1.10          # For local transcription
+# assemblyai>=0.17.0       # For AssemblyAI transcription
+# librosa>=0.10.0          # For advanced audio processing
