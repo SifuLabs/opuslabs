@@ -13,6 +13,15 @@ import random
 from typing import Dict, Any, Optional, List, Tuple
 from pathlib import Path
 
+# Load environment variables from .env file
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+    print("✅ Environment variables loaded from .env")
+except ImportError:
+    print("⚠️  python-dotenv not installed - environment variables from system only")
+    pass
+
 class VideoEditingCopilot:
     """Production-ready Video Editing Copilot with graceful degradation"""
     
@@ -185,6 +194,7 @@ class VideoEditingCopilot:
         """Request video input from user"""
         print("\n📁 Please provide your video:")
         print("   • Enter file path")
+        print("   • Enter YouTube URL")
         print("   • Or drag & drop video file")
         print("   • Or press Enter for demo mode")
         
@@ -193,6 +203,10 @@ class VideoEditingCopilot:
             
             if not video_input:
                 return None
+            
+            # Check if it's a YouTube URL
+            if 'youtube.com' in video_input or 'youtu.be' in video_input:
+                return self._download_youtube_video(video_input)
             
             # Clean up the path (remove quotes)
             video_path = video_input.strip('"\'')
@@ -205,6 +219,73 @@ class VideoEditingCopilot:
                 
         except KeyboardInterrupt:
             print("\n⏹️  Cancelled by user")
+            return None
+    
+    def _download_youtube_video(self, url: str) -> Optional[str]:
+        """Download YouTube video using yt-dlp"""
+        try:
+            import yt_dlp
+            
+            # Create downloads directory
+            downloads_dir = os.path.join(os.getcwd(), 'downloads')
+            os.makedirs(downloads_dir, exist_ok=True)
+            
+            print(f"📥 Downloading from YouTube...")
+            print(f"🔗 URL: {url}")
+            
+            # Configure yt-dlp options
+            ydl_opts = {
+                'outtmpl': os.path.join(downloads_dir, '%(title)s.%(ext)s'),
+                'format': 'best[ext=mp4]/best',  # Prefer mp4, fallback to best quality
+                'noplaylist': True,  # Only download single video
+            }
+            
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                # Get video info first
+                info = ydl.extract_info(url, download=False)
+                title = info.get('title', 'Unknown')
+                duration = info.get('duration', 0)
+                
+                print(f"🎬 Title: {title}")
+                print(f"⏱️ Duration: {duration//60}:{duration%60:02d}")
+                
+                # Download the video
+                print("⬇️ Downloading...")
+                ydl.download([url])
+                
+                # Find the downloaded file
+                expected_filename = ydl.prepare_filename(info)
+                
+                # yt-dlp might change the extension, so check for common formats
+                base_name = os.path.splitext(expected_filename)[0]
+                possible_extensions = ['.mp4', '.webm', '.mkv', '.avi']
+                
+                for ext in possible_extensions:
+                    potential_file = base_name + ext
+                    if os.path.exists(potential_file):
+                        print(f"✅ Downloaded: {os.path.basename(potential_file)}")
+                        return potential_file
+                
+                # If exact match not found, look for any video file in downloads
+                if os.path.exists(downloads_dir):
+                    video_files = [f for f in os.listdir(downloads_dir) 
+                                 if f.lower().endswith(('.mp4', '.webm', '.mkv', '.avi'))]
+                    if video_files:
+                        # Get the most recently created file
+                        video_files.sort(key=lambda x: os.path.getctime(os.path.join(downloads_dir, x)), reverse=True)
+                        downloaded_file = os.path.join(downloads_dir, video_files[0])
+                        print(f"✅ Downloaded: {os.path.basename(downloaded_file)}")
+                        return downloaded_file
+                
+                print("❌ Could not locate downloaded file")
+                return None
+                
+        except ImportError:
+            print("❌ yt-dlp not installed!")
+            print("💡 Install with: pip install yt-dlp")
+            return None
+        except Exception as e:
+            print(f"❌ Download failed: {e}")
             return None
     
     def _process_real_video(self, video_path: str, preferences: Dict[str, Any], user_input: str) -> str:
