@@ -124,14 +124,19 @@ class VideoEditingCopilot:
             self.available_features.add('full_processing')
     
     def _check_ffmpeg(self) -> bool:
-        """Check if FFmpeg is available"""
+        """Check if FFmpeg is available in PATH"""
+        import subprocess
         try:
-            import subprocess
-            result = subprocess.run(['ffmpeg', '-version'], 
-                                  capture_output=True, text=True, timeout=5)
-            if result is None:
-                return False
+            result = subprocess.run(
+                ['ffmpeg', '-version'],
+                capture_output=True, text=True, timeout=5
+            )
             return result.returncode == 0
+        except FileNotFoundError:
+            print("⚠️  FFmpeg not found in PATH.")
+            print("   Install it with:  winget install --id Gyan.FFmpeg")
+            print("   Then restart your terminal so the PATH is refreshed.")
+            return False
         except Exception as e:
             print(f"⚠️  FFmpeg check failed: {e}")
             return False
