@@ -2,13 +2,18 @@
 Enhanced Transcript Analysis with Gemini AI
 
 Uses Google's Gemini API for intelligent content analysis and moment detection.
+Includes: disk caching, transcript compression, and retry with exponential backoff
+to minimise API credit usage and handle rate limits gracefully.
 """
 
 import os
 import re
+import time
+import hashlib
+import json
+from pathlib import Path
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass
-import json
 
 # Optional imports with error handling
 try:
@@ -27,6 +32,23 @@ except ImportError:
     print("⚠️ NLTK or textstat not available. Install with: pip install nltk textstat")
     nltk = None
     NLTK_AVAILABLE = False
+
+# ---------------------------------------------------------------------------
+# Configuration (all tunable via environment variables)
+# ---------------------------------------------------------------------------
+
+# Max characters of compressed transcript sent to Gemini per request.
+# ~4 000 chars ≈ ~1 000 tokens — enough for good clip selection while
+# keeping costs low. Raise to 8000 on a paid plan.
+MAX_TRANSCRIPT_CHARS = int(os.getenv('GEMINI_MAX_TRANSCRIPT_CHARS', '4000'))
+
+# Gemini model. gemini-1.5-flash-8b is the free-tier-friendly default
+# (higher RPM, lower cost). Switch to gemini-1.5-flash for more capability.
+DEFAULT_MODEL = os.getenv('GEMINI_MODEL', 'gemini-1.5-flash-8b')
+
+# Cache directory. Set GEMINI_CACHE_DIR=off to disable caching entirely.
+_cache_dir_env = os.getenv('GEMINI_CACHE_DIR', './.cache/gemini')
+CACHE_DIR = Path(_cache_dir_env) if _cache_dir_env.lower() != 'off' else None
 
 @dataclass
 class EngagingSegment:
@@ -51,14 +73,20 @@ class GeminiTranscriptAnalyzer:
         api_key = os.getenv('GEMINI_API_KEY') or os.getenv('GOOGLE_API_KEY')
         if api_key and GEMINI_AVAILABLE:
             genai.configure(api_key=api_key)
-            self.model = genai.GenerativeModel('gemini-1.5-flash')
+            self.model = genai.GenerativeModel(DEFAULT_MODEL)
             self.use_ai_analysis = True
+            print(f"✅ Gemini model: {DEFAULT_MODEL}")
         else:
             if not GEMINI_AVAILABLE:
                 print("⚠️ Gemini not available. Using rule-based analysis only.")
             elif not api_key:
                 print("⚠️ No Gemini API key found. Set GEMINI_API_KEY environment variable.")
             self.use_ai_analysis = False
+
+        # Set up disk cache
+        self._cache_enabled = CACHE_DIR is not None
+        if self._cache_enabled:
+            CACHE_DIR.mkdir(parents=True, exist_ok=True)
         
         # Download NLTK data if needed
         if NLTK_AVAILABLE:
@@ -120,50 +148,157 @@ class GeminiTranscriptAnalyzer:
         max_length: int,
         style: str
     ) -> List[EngagingSegment]:
-        """Use Gemini AI for intelligent content analysis with timestamped transcript"""
-        try:
-            print("🧠 Analyzing content with Gemini AI...")
-            
-            # Build a timestamped transcript string so Gemini can return real timestamps
-            timestamped_transcript = self._build_timestamped_transcript(segments)
-            
-            # Create analysis prompt that includes actual timestamps
-            prompt = self._create_analysis_prompt(
-                timestamped_transcript, target_clips, min_length, max_length, style
-            )
-            
-            # Get AI analysis
-            response = self.model.generate_content(prompt)
-            ai_analysis = self._parse_gemini_analysis(response.text)
-            
-            if not ai_analysis:
-                print("⚠️ AI analysis failed, falling back to rule-based")
-                return self._analyze_with_rules(segments, target_clips, min_length, max_length, style)
-            
-            # Convert AI analysis to segments using direct timestamps
-            result = self._create_segments_from_ai_analysis(segments, ai_analysis, style)
-            
-            if not result:
-                print("⚠️ No valid segments from AI, falling back to rule-based")
-                return self._analyze_with_rules(segments, target_clips, min_length, max_length, style)
-            
-            return result
-            
-        except Exception as e:
-            print(f"❌ Gemini analysis failed: {e}")
-            print("🔄 Falling back to rule-based analysis...")
+        """Use Gemini AI — with disk caching and retry on rate limits"""
+
+        # 1. Check disk cache first — free, instant, no API call
+        cache_key = self._cache_key(segments, target_clips, min_length, max_length, style)
+        cached = self._load_cache(cache_key)
+        if cached is not None:
+            result = self._create_segments_from_ai_analysis(segments, cached, style)
+            if result:
+                return result
+
+        print("🧠 Analyzing content with Gemini AI...")
+
+        # 2. Build compressed transcript (fewer tokens = lower cost + less rate limiting)
+        timestamped_transcript = self._build_timestamped_transcript(segments)
+        prompt = self._create_analysis_prompt(
+            timestamped_transcript, target_clips, min_length, max_length, style
+        )
+
+        # 3. Call Gemini with exponential backoff on 429 / quota errors
+        ai_analysis = self._call_gemini_with_retry(prompt)
+
+        if not ai_analysis:
+            print("⚠️ AI analysis returned no data, falling back to rule-based")
             return self._analyze_with_rules(segments, target_clips, min_length, max_length, style)
 
+        # 4. Persist result so next run costs nothing
+        self._save_cache(cache_key, ai_analysis)
+
+        result = self._create_segments_from_ai_analysis(segments, ai_analysis, style)
+        if not result:
+            print("⚠️ No valid segments from AI, falling back to rule-based")
+            return self._analyze_with_rules(segments, target_clips, min_length, max_length, style)
+        return result
+
+    def _call_gemini_with_retry(self, prompt: str, max_retries: int = 3) -> Optional[Dict]:
+        """Call Gemini with exponential backoff on rate-limit (429) errors."""
+        delay = 30  # seconds before first retry
+        for attempt in range(1, max_retries + 2):  # +1 for the initial attempt
+            try:
+                response = self.model.generate_content(prompt)
+                return self._parse_gemini_analysis(response.text)
+            except Exception as e:
+                err = str(e)
+                is_rate_limit = '429' in err or 'RATE_LIMIT' in err or 'Quota exceeded' in err
+                if is_rate_limit and attempt <= max_retries:
+                    print(f"⏳ Rate limit hit — waiting {delay}s before retry {attempt}/{max_retries}...")
+                    time.sleep(delay)
+                    delay = min(delay * 2, 120)  # cap at 2 minutes
+                    continue
+                # Non-retriable error or retries exhausted
+                print(f"❌ Gemini call failed: {e}")
+                if is_rate_limit:
+                    print("   Tip: the result is cached after a successful run, so retries won't cost extra.")
+                    print(f"   Or set GEMINI_MODEL=gemini-2.0-flash-lite in .env for higher free-tier limits.")
+                return None
+        return None
+
+    # -----------------------------------------------------------------------
+    # Cache helpers
+    # -----------------------------------------------------------------------
+    def _cache_key(self, segments: List[Dict], target_clips: int,
+                   min_length: int, max_length: int, style: str) -> str:
+        """Stable hash over all analysis inputs."""
+        payload = json.dumps({
+            'segs': [(s.get('start'), s.get('end'), s.get('text', '')) for s in segments],
+            'n': target_clips, 'min': min_length, 'max': max_length,
+            'style': style, 'model': DEFAULT_MODEL,
+        }, sort_keys=True)
+        return hashlib.sha256(payload.encode()).hexdigest()[:16]
+
+    def _load_cache(self, key: str) -> Optional[Dict]:
+        if not self._cache_enabled:
+            return None
+        path = CACHE_DIR / f"{key}.json"
+        if path.exists():
+            try:
+                data = json.loads(path.read_text(encoding='utf-8'))
+                print(f"⚡ Loaded cached analysis ({key[:8]}…) — no API call needed")
+                return data
+            except Exception:
+                pass
+        return None
+
+    def _save_cache(self, key: str, data: Dict) -> None:
+        if not self._cache_enabled:
+            return
+        try:
+            (CACHE_DIR / f"{key}.json").write_text(
+                json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8'
+            )
+            print(f"💾 Analysis cached ({key[:8]}…) — future runs won't call the API")
+        except Exception:
+            pass
+
+    # -----------------------------------------------------------------------
+    # Transcript compression
+    # -----------------------------------------------------------------------
     def _build_timestamped_transcript(self, segments: List[Dict]) -> str:
-        """Build a transcript string with timestamps that Gemini can reference"""
-        lines = []
+        """
+        Build a *compressed* timestamped transcript to minimise token usage.
+
+        Strategy:
+          1. Merge consecutive short segments (<8 words) into bigger ones.
+          2. If the result still exceeds MAX_TRANSCRIPT_CHARS, sample evenly
+             so Gemini sees the whole video but at lower resolution.
+        """
+        # Step 1 — merge short consecutive segments
+        merged: List[Dict] = []
         for seg in segments:
-            start = seg.get('start', 0)
-            end = seg.get('end', 0)
             text = seg.get('text', '').strip()
-            if text:
-                lines.append(f"[{start:.2f}s - {end:.2f}s] {text}")
-        return '\n'.join(lines)
+            if not text:
+                continue
+            if merged and len(merged[-1]['text'].split()) < 8:
+                merged[-1]['text'] += ' ' + text
+                merged[-1]['end'] = seg.get('end', merged[-1]['end'])
+            else:
+                merged.append({'start': seg['start'],
+                                'end': seg.get('end', seg['start']),
+                                'text': text})
+
+        lines = [f"[{s['start']:.1f}s-{s['end']:.1f}s] {s['text']}" for s in merged]
+
+        # Step 2 — if still too long, sample evenly across the video
+        full = '\n'.join(lines)
+        if len(full) <= MAX_TRANSCRIPT_CHARS:
+            return full
+
+        total = len(lines)
+        head_n = max(1, int(total * 0.15))
+        tail_n = max(1, int(total * 0.10))
+        mid_lines = lines[head_n:-tail_n]
+
+        # How many middle lines fit in the remaining budget?
+        budget_for_mid = MAX_TRANSCRIPT_CHARS - sum(len(l) + 1 for l in lines[:head_n]) \
+                         - sum(len(l) + 1 for l in lines[-tail_n:]) - 60
+        if budget_for_mid > 0 and mid_lines:
+            avg_line = max(1, sum(len(l) for l in mid_lines) // len(mid_lines))
+            keep_n = max(1, budget_for_mid // avg_line)
+            step = max(1, len(mid_lines) // keep_n)
+            mid_lines = mid_lines[::step]
+
+        compressed_lines = (
+            lines[:head_n]
+            + [f"… [{total - head_n - tail_n} segments condensed] …"]
+            + mid_lines
+            + lines[-tail_n:]
+        )
+        compressed = '\n'.join(compressed_lines)
+        saved_pct = int((1 - len(compressed) / len(full)) * 100)
+        print(f"📉 Transcript compressed by ~{saved_pct}% ({len(full)} → {len(compressed)} chars)")
+        return compressed
     
     def _create_analysis_prompt(
         self, 
