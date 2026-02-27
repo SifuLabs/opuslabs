@@ -192,8 +192,8 @@ class ClipGenerator:
         try:
             # Load video and extract segment
             with VideoFileClip(video_path) as video:
-                # Extract the segment
-                clip = video.subclip(segment.start_time, segment.end_time)
+                # Extract the segment (MoviePy 2.x uses subclipped)
+                clip = video.subclipped(segment.start_time, segment.end_time)
                 
                 # Resize to vertical format
                 processed_clip = self._resize_to_vertical(clip)
@@ -229,49 +229,62 @@ class ClipGenerator:
         output_path: str, 
         settings: Dict[str, any]
     ) -> bool:
-        """Process clip using FFmpeg (faster, basic processing)"""
+        """Process clip using FFmpeg (fast input-seeking for performance)"""
         try:
-            # Build ffmpeg command with caption support
+            duration = segment.end_time - segment.start_time
+            if duration <= 0:
+                print(f"❌ Invalid segment duration: {duration}")
+                return False
+
+            # Use input seeking (-ss before -i) for fast seeking
             cmd = [
-                'ffmpeg', '-i', video_path,
+                'ffmpeg',
                 '-ss', str(segment.start_time),
-                '-t', str(segment.end_time - segment.start_time),
+                '-i', video_path,
+                '-t', str(duration),
             ]
-            
-            # Add video filters for vertical format and optional captions
-            video_filters = [
+
+            # Video filters: scale to vertical 9:16, pad with blurred background
+            vf_parts = [
                 f'scale={self.target_width}:{self.target_height}:force_original_aspect_ratio=decrease',
-                f'pad={self.target_width}:{self.target_height}:(ow-iw)/2:(oh-ih)/2'
+                f'pad={self.target_width}:{self.target_height}:(ow-iw)/2:(oh-ih)/2:color=black',
             ]
-            
-            # Add simple text overlay if segment has text
-            if hasattr(segment, 'text') and segment.text and len(segment.text.strip()) > 0:
-                # Simple text overlay (basic captions)
-                clean_text = segment.text.replace("'", "\\'").replace('"', '\\"')[:100]
-                if clean_text:
-                    video_filters.append(
-                        f"drawtext=text='{clean_text}':fontcolor=white:fontsize=24:x=(w-text_w)/2:y=h-60"
-                    )
-            
-            # Combine filters
-            cmd.extend(['-vf', ','.join(video_filters)])
-            
-            # Add remaining options
+
+            # Simple caption overlay if text available (escape for drawtext)
+            if hasattr(segment, 'text') and segment.text and len(segment.text.strip()) > 10:
+                # Safely escape text for ffmpeg drawtext filter
+                safe_text = (segment.text[:120]
+                             .replace('\\', '\\\\')
+                             .replace("'", "\u2019")  # replace apostrophe with unicode right single quote
+                             .replace(':', '\\:')
+                             .replace('%', '\\%'))
+                safe_text = safe_text.replace('\n', ' ')
+                vf_parts.append(
+                    f"drawtext=text='{safe_text}':fontcolor=white:fontsize=36"
+                    f":borderw=2:bordercolor=black:x=(w-text_w)/2:y=h*0.85"
+                    f":line_spacing=8:fix_bounds=true"
+                )
+
             cmd.extend([
+                '-vf', ','.join(vf_parts),
                 '-r', str(self.target_fps),
                 '-c:v', 'libx264',
+                '-preset', 'fast',
+                '-crf', '23',
                 '-c:a', 'aac',
+                '-b:a', '128k',
                 '-movflags', '+faststart',
-                '-y',  # Overwrite output
-                output_path
+                '-avoid_negative_ts', 'make_zero',
+                '-y',
+                output_path,
             ])
-            
+
             result = subprocess.run(cmd, capture_output=True, text=True)
-            
+
             if result.returncode == 0:
                 return os.path.exists(output_path)
             else:
-                print(f"FFmpeg error: {result.stderr}")
+                print(f"FFmpeg error: {result.stderr[-500:]}")
                 return False
                 
         except Exception as e:
@@ -291,22 +304,22 @@ class ClipGenerator:
         current_ratio = w / h
         
         if current_ratio > target_ratio:
-            # Video is wider - crop sides
+            # Video is wider - crop sides (MoviePy 2.x uses cropped)
             new_width = int(h * target_ratio)
             x_center = w / 2
             x1 = int(x_center - new_width / 2)
             x2 = int(x_center + new_width / 2)
-            clip = clip.crop(x1=x1, x2=x2)
+            clip = clip.cropped(x1=x1, x2=x2)
         else:
             # Video is taller - crop top/bottom
             new_height = int(w / target_ratio)
             y_center = h / 2
             y1 = int(y_center - new_height / 2)
             y2 = int(y_center + new_height / 2)
-            clip = clip.crop(y1=y1, y2=y2)
+            clip = clip.cropped(y1=y1, y2=y2)
         
-        # Resize to target resolution
-        return clip.resize((self.target_width, self.target_height))
+        # Resize to target resolution (MoviePy 2.x uses resized)
+        return clip.resized((self.target_width, self.target_height))
     
     def _add_captions_moviepy(self, clip, text: str):
         """Add animated captions to clip using MoviePy"""
@@ -330,16 +343,22 @@ class ClipGenerator:
                 start_time = i * duration_per_chunk
                 end_time = (i + 1) * duration_per_chunk
                 
-                # Create text clip
-                txt_clip = TextClip(
-                    chunk,
-                    fontsize=self.caption_style['fontsize'],
-                    font=self.caption_style['font'],
-                    color=self.caption_style['color'],
-                    stroke_color=self.caption_style['stroke_color'],
-                    stroke_width=self.caption_style['stroke_width'],
-                    method=self.caption_style['method']
-                ).set_position(('center', 'bottom')).set_duration(duration_per_chunk).set_start(start_time)
+                # Create text clip (MoviePy 2.x API)
+                txt_clip = (
+                    TextClip(
+                        text=chunk,
+                        font_size=self.caption_style['fontsize'],
+                        font=self.caption_style['font'],
+                        color=self.caption_style['color'],
+                        stroke_color=self.caption_style['stroke_color'],
+                        stroke_width=self.caption_style['stroke_width'],
+                        method=self.caption_style['method'],
+                        size=(self.target_width - 80, None),
+                    )
+                    .with_position(('center', 'bottom'))
+                    .with_duration(duration_per_chunk)
+                    .with_start(start_time)
+                )
                 
                 caption_clips.append(txt_clip)
             

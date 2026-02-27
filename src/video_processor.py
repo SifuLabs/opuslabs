@@ -22,6 +22,18 @@ except Exception as e:
     whisper = None
     WHISPER_AVAILABLE = False
 
+def _parse_fps(fps_str: str) -> float:
+    """Safely parse fractional FPS string like '30000/1001' without using eval()"""
+    try:
+        if '/' in fps_str:
+            num, den = fps_str.split('/', 1)
+            den = int(den)
+            return int(num) / den if den != 0 else 0.0
+        return float(fps_str)
+    except (ValueError, ZeroDivisionError):
+        return 0.0
+
+
 class VideoProcessor:
     """Handles video processing and transcription"""
     
@@ -139,7 +151,7 @@ class VideoProcessor:
                     'duration': float(info['format'].get('duration', 0)),
                     'width': video_stream.get('width') if video_stream else None,
                     'height': video_stream.get('height') if video_stream else None,
-                    'fps': eval(video_stream.get('r_frame_rate', '0/1')) if video_stream else None,
+                    'fps': self._parse_fps(video_stream.get('r_frame_rate', '0/1')) if video_stream else None,
                     'has_audio': audio_stream is not None,
                     'filesize': int(info['format'].get('size', 0))
                 }
@@ -265,10 +277,10 @@ class VideoProcessor:
             
             print("🎤 Transcribing with Gemini API...")
             
-            # Configure Gemini
-            api_key = os.getenv('GOOGLE_API_KEY')
+            # Support both GEMINI_API_KEY and GOOGLE_API_KEY (prefer GEMINI_API_KEY)
+            api_key = os.getenv('GEMINI_API_KEY') or os.getenv('GOOGLE_API_KEY')
             if not api_key:
-                print("❌ GOOGLE_API_KEY not found in environment")
+                print("❌ No API key found. Set GEMINI_API_KEY environment variable.")
                 return self._create_simple_transcript(video_path)
             
             genai.configure(api_key=api_key)

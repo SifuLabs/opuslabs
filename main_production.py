@@ -208,41 +208,59 @@ class VideoEditingCopilot:
             return None
     
     def _process_real_video(self, video_path: str, preferences: Dict[str, Any], user_input: str) -> str:
-        """Process actual video file with full pipeline"""
+        """Process actual video file using the full src/ pipeline"""
+        try:
+            from src.video_processor import VideoProcessor
+            from src.gemini_analyzer import GeminiTranscriptAnalyzer
+            from src.clip_generator import ClipGenerator
+        except ImportError as e:
+            return f"❌ Could not import processing modules: {e}"
+
         try:
             print(f"🎥 Processing: {os.path.basename(video_path)}")
-            
-            # Step 1: Get video info
-            duration = self._get_video_duration(video_path)
-            print(f"📏 Duration: {duration:.1f} seconds")
-            
-            # Step 2: Transcription (if available)
-            transcript = None
-            if 'transcription' in self.available_features:
-                print("🎤 Generating transcript...")
-                transcript = self._transcribe_video(video_path)
-            
-            # Step 3: AI Analysis
-            if 'ai_analysis' in self.available_features and transcript:
-                print("🧠 AI analyzing content...")
-                analysis = self._analyze_with_gemini(transcript, preferences, user_input)
-            else:
-                analysis = self._create_simple_analysis(video_path, preferences)
-            
-            # Step 4: Generate clips
-            print("✂️ Planning clips...")
-            clips = self._plan_clips(video_path, analysis, preferences)
-            
-            # Step 5: Create actual clips (if video processing available)
-            if 'video_processing' in self.available_features:
-                print("🎬 Creating video clips...")
-                created_clips = self._create_clips(video_path, clips)
-                return self._format_success_response(created_clips, preferences)
-            else:
-                return self._format_plan_response(clips, preferences)
-                
+
+            # Step 1: Transcribe video → structured dict with real segment timestamps
+            print("🎤 Transcribing video...")
+            processor = VideoProcessor()
+            transcript = processor.transcribe_video(video_path)
+            if not transcript or not transcript.get('segments'):
+                return "❌ Transcription failed — no segments found. Check FFmpeg and Whisper setup."
+
+            duration = transcript.get('duration', 0) or transcript['segments'][-1]['end']
+            seg_count = len(transcript['segments'])
+            print(f"📏 Duration: {duration:.1f}s | Segments: {seg_count}")
+
+            # Step 2: AI analysis using timestamped transcript
+            clip_count = preferences.get('clip_count', self.config.get('default_clip_count', 5))
+            min_len = preferences.get('clip_length_min', 30)
+            max_len = preferences.get('clip_length_max', 60)
+            style = preferences.get('style', 'engaging')
+
+            print("🧠 Analyzing content for engaging moments...")
+            analyzer = GeminiTranscriptAnalyzer()
+            engaging_segments = analyzer.find_engaging_moments(
+                transcript,
+                target_clips=clip_count,
+                min_length=min_len,
+                max_length=max_len,
+                style=style
+            )
+
+            if not engaging_segments:
+                return "❌ No engaging segments found. Try a different style or check that the video has speech."
+
+            # Step 3: Create clips
+            print(f"✂️ Creating {len(engaging_segments)} clips...")
+            generator = ClipGenerator()
+            settings = {'add_captions': True, 'style': style}
+            clips_info = generator.create_clips(video_path, engaging_segments, settings)
+
+            return self._format_success_response(clips_info, preferences)
+
         except Exception as e:
-            return f"❌ Processing error: {e}\n💡 Falling back to demo mode..."
+            import traceback
+            traceback.print_exc()
+            return f"❌ Processing error: {e}"
     
     def _get_video_duration(self, video_path: str) -> float:
         """Get video duration using MoviePy"""
@@ -558,22 +576,27 @@ class VideoEditingCopilot:
         """Format response for successful video processing"""
         response = "🎉 **Video Processing Complete!**\n\n"
         
-        successful_clips = [c for c in clips if c.get('created', False)]
-        failed_clips = [c for c in clips if not c.get('created', True)]
+        successful_clips = [c for c in clips if c.get('output_path') and os.path.exists(c['output_path'])]
+        failed_clips = [c for c in clips if c not in successful_clips]
         
         if successful_clips:
             response += f"✅ **{len(successful_clips)} clips created successfully:**\n\n"
             
             for clip in successful_clips:
-                response += f"📱 **Clip {clip['clip_number']}**: {clip['title']}\n"
-                response += f"   • Duration: {clip['duration']} seconds\n"
-                response += f"   • File: {clip['output_path']}\n"
-                response += f"   • Size: {clip.get('file_size', 0) // 1024}KB\n\n"
+                size_kb = os.path.getsize(clip['output_path']) // 1024
+                response += f"📱 **Clip {clip.get('clip_number', '?')}**: {clip.get('title', 'Untitled')}\n"
+                response += f"   • Duration: {clip.get('duration', 0):.1f}s  ({clip.get('start_time', 0):.1f}s → {clip.get('end_time', 0):.1f}s)\n"
+                response += f"   • Hook: \"{clip.get('hook', '')}\"\n"
+                response += f"   • Engagement Score: {clip.get('engagement_score', 0):.1f}/10\n"
+                response += f"   • File: {clip['output_path']}  ({size_kb}KB)\n"
+                if clip.get('hashtags'):
+                    response += f"   • Tags: {' '.join(clip['hashtags'][:5])}\n"
+                response += "\n"
         
         if failed_clips:
             response += f"⚠️  **{len(failed_clips)} clips had issues:**\n"
             for clip in failed_clips:
-                response += f"   • Clip {clip['clip_number']}: {clip.get('error', 'Unknown error')}\n"
+                response += f"   • Clip {clip.get('clip_number', '?')}: {clip.get('error', 'Unknown error')}\n"
         
         response += "\n🚀 **Your clips are ready for social media!**\n"
         return response

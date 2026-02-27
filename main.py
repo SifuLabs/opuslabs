@@ -129,8 +129,11 @@ class VideoEditingCopilot:
             import subprocess
             result = subprocess.run(['ffmpeg', '-version'], 
                                   capture_output=True, text=True, timeout=5)
+            if result is None:
+                return False
             return result.returncode == 0
-        except:
+        except Exception as e:
+            print(f"⚠️  FFmpeg check failed: {e}")
             return False
     
     def process_video_request(self, user_input: str, video_path: Optional[str] = None) -> str:
@@ -289,41 +292,62 @@ class VideoEditingCopilot:
             return None
     
     def _process_real_video(self, video_path: str, preferences: Dict[str, Any], user_input: str) -> str:
-        """Process actual video file with full pipeline"""
+        """Process actual video file using the full src/ pipeline"""
+        try:
+            from src.video_processor import VideoProcessor
+            from src.gemini_analyzer import GeminiTranscriptAnalyzer
+            from src.clip_generator import ClipGenerator
+        except ImportError as e:
+            return f"❌ Could not import processing modules: {e}"
+
         try:
             print(f"🎥 Processing: {os.path.basename(video_path)}")
-            
-            # Step 1: Get video info
-            duration = self._get_video_duration(video_path)
-            print(f"📏 Duration: {duration:.1f} seconds")
-            
-            # Step 2: Transcription (if available)
-            transcript = None
-            if 'transcription' in self.available_features:
-                print("🎤 Generating transcript...")
-                transcript = self._transcribe_video(video_path)
-            
-            # Step 3: AI Analysis
-            if 'ai_analysis' in self.available_features and transcript:
-                print("🧠 AI analyzing content...")
-                analysis = self._analyze_with_gemini(transcript, preferences, user_input)
-            else:
-                analysis = self._create_simple_analysis(video_path, preferences)
-            
-            # Step 4: Generate clips
-            print("✂️ Planning clips...")
-            clips = self._plan_clips(video_path, analysis, preferences)
-            
-            # Step 5: Create actual clips (if video processing available)
-            if 'video_processing' in self.available_features:
-                print("🎬 Creating video clips...")
-                created_clips = self._create_clips(video_path, clips)
-                return self._format_success_response(created_clips, preferences)
-            else:
-                return self._format_plan_response(clips, preferences)
-                
+
+            # Step 1: Transcribe video → structured dict with real segment timestamps
+            print("🎤 Transcribing video...")
+            processor = VideoProcessor()
+            transcript = processor.transcribe_video(video_path)
+            if not transcript or not transcript.get('segments'):
+                return "❌ Transcription failed — no segments found. Check FFmpeg and Whisper setup."
+
+            duration = transcript.get('duration', 0) or transcript['segments'][-1]['end']
+            seg_count = len(transcript['segments'])
+            print(f"📏 Duration: {duration:.1f}s | Segments: {seg_count}")
+
+            # Step 2: AI analysis with accurate timestamps
+            clip_count = preferences.get('clip_count', self.config.get('default_clip_count', 5))
+            min_len = preferences.get('clip_length_min', 30)
+            max_len = preferences.get('clip_length_max', 60)
+            style = preferences.get('style', 'engaging')
+
+            print("🧠 Analyzing content for engaging moments...")
+            analyzer = GeminiTranscriptAnalyzer()
+            engaging_segments = analyzer.find_engaging_moments(
+                transcript,
+                target_clips=clip_count,
+                min_length=min_len,
+                max_length=max_len,
+                style=style
+            )
+
+            if not engaging_segments:
+                return "❌ No engaging segments found. Try a different style or check that the video has speech."
+
+            # Step 3: Create clips
+            print(f"✂️ Creating {len(engaging_segments)} clips...")
+            generator = ClipGenerator()
+            settings = {
+                'add_captions': True,
+                'style': style,
+            }
+            clips_info = generator.create_clips(video_path, engaging_segments, settings)
+
+            return self._format_success_response(clips_info, preferences)
+
         except Exception as e:
-            return f"❌ Processing error: {e}\n💡 Falling back to demo mode..."
+            import traceback
+            traceback.print_exc()
+            return f"❌ Processing error: {e}"
     
     def _get_video_duration(self, video_path: str) -> float:
         """Get video duration using MoviePy"""
@@ -355,30 +379,56 @@ class VideoEditingCopilot:
             style = preferences.get('style', 'engaging')
             clip_count = preferences.get('clip_count', 5)
             
+            # Enhanced prompt for better content analysis
             prompt = f"""
-            Analyze this transcript for creating {clip_count} {style} short-form clips:
-            
+            As a professional video editor and social media expert, analyze this transcript to create {clip_count} highly engaging {style} short-form clips.
+
             User Request: {user_request}
-            
+            Target Style: {style}
+            Desired Clips: {clip_count}
+
             Transcript:
-            {transcript[:4000]}  # Limit for API
+            {transcript[:6000]}
+
+            Please identify the most compelling moments that would work best as short-form content by analyzing:
             
-            Find the most engaging moments and suggest:
-            1. Specific timestamps for clip starts
-            2. Compelling hooks/titles
-            3. Why each moment is engaging
-            4. Suggested clip duration
+            1. **Hook Potential**: Look for surprising statements, questions, or dramatic moments
+            2. **Emotional Peaks**: Find moments of high energy, laughter, insight, or strong emotion  
+            3. **Complete Thoughts**: Ensure each clip has a beginning, middle, and satisfying conclusion
+            4. **Visual Interest**: Consider moments that likely have dynamic visuals or gestures
+            5. **Shareability**: Pick moments people would want to share or comment on
             
-            Format as JSON with clip_suggestions array.
+            For each recommended clip, provide:
+            - A compelling hook/title (8-12 words max)
+            - The exact key phrase or sentence that makes it engaging
+            - Why this moment would perform well on social media
+            - Estimated optimal length (15-60 seconds)
+            - The type of audience reaction expected
+            
+            Focus on finding moments that:
+            - Start with immediate impact (first 3 seconds crucial)
+            - Have clear value or entertainment
+            - End with satisfaction or curiosity
+            - Work without prior context
+            
+            Return your analysis as structured recommendations focusing on the most viral-worthy segments.
             """
             
             response = self.gemini_model.generate_content(prompt)
+            ai_text = response.text
             
-            # Parse AI response (simplified)
+            # Parse AI insights and extract practical suggestions
+            suggestions = self._parse_ai_suggestions(ai_text, transcript, clip_count)
+            
             analysis = {
                 'style': style,
-                'suggested_clips': [],
-                'ai_insights': response.text
+                'suggested_clips': suggestions,
+                'ai_insights': ai_text,
+                'content_analysis': {
+                    'high_engagement_moments': len(suggestions),
+                    'recommended_style': style,
+                    'content_type': self._detect_content_type(transcript)
+                }
             }
             
             return analysis
@@ -386,6 +436,161 @@ class VideoEditingCopilot:
         except Exception as e:
             print(f"⚠️  AI analysis failed: {e}")
             return self._create_simple_analysis("", preferences)
+    
+    def _parse_ai_suggestions(self, ai_text: str, transcript: str, clip_count: int) -> List[Dict[str, Any]]:
+        """Parse AI suggestions into actionable clip data"""
+        suggestions = []
+        
+        try:
+            # Look for key phrases that indicate engaging moments
+            transcript_sentences = transcript.split('. ')
+            ai_text_lower = ai_text.lower()
+            
+            # AI-identified patterns
+            hook_indicators = [
+                'surprising', 'shocking', 'amazing', 'unbelievable', 'incredible',
+                'secret', 'revealed', 'truth', 'mistake', 'wrong', 'right way',
+                'never knew', 'didn\'t know', 'most people', 'everyone should',
+                'game changer', 'life changing', 'mind blowing'
+            ]
+            
+            # Find sentences with high engagement potential
+            engaging_sentences = []
+            for i, sentence in enumerate(transcript_sentences):
+                sentence_lower = sentence.lower()
+                score = 0
+                
+                # Score based on AI indicators
+                for indicator in hook_indicators:
+                    if indicator in sentence_lower or indicator in ai_text_lower:
+                        score += 2
+                
+                # Score based on sentence characteristics
+                if '?' in sentence:  # Questions are engaging
+                    score += 1
+                if len(sentence.split()) > 8:  # Substantial content
+                    score += 1
+                if any(word in sentence_lower for word in ['you', 'your', 'we']):
+                    score += 1  # Direct address
+                
+                if score > 0:
+                    engaging_sentences.append({
+                        'sentence': sentence.strip(),
+                        'index': i,
+                        'score': score,
+                        'estimated_time': i * 3  # Rough estimate: 3 seconds per sentence
+                    })
+            
+            # Sort by engagement score
+            engaging_sentences.sort(key=lambda x: x['score'], reverse=True)
+            
+            # Create clips from top moments
+            selected_count = min(len(engaging_sentences), clip_count)
+            for i in range(selected_count):
+                moment = engaging_sentences[i]
+                
+                # Create compelling title from sentence
+                title = self._create_clip_title(moment['sentence'], i+1)
+                
+                suggestion = {
+                    'clip_number': i + 1,
+                    'title': title,
+                    'key_phrase': moment['sentence'][:100] + '...' if len(moment['sentence']) > 100 else moment['sentence'],
+                    'engagement_reason': self._explain_engagement(moment['sentence']),
+                    'estimated_start': max(0, moment['estimated_time'] - 5),  # Start 5s before
+                    'recommended_duration': min(60, max(20, len(moment['sentence'].split()) * 2)),
+                    'engagement_score': moment['score']
+                }
+                suggestions.append(suggestion)
+            
+            # Fill remaining slots if needed
+            while len(suggestions) < clip_count:
+                i = len(suggestions)
+                suggestions.append({
+                    'clip_number': i + 1,
+                    'title': f'Engaging Moment {i + 1}',
+                    'key_phrase': 'Additional compelling content identified',
+                    'engagement_reason': 'Strong content value for social media',
+                    'estimated_start': i * 60,  # Spread across video
+                    'recommended_duration': 30,
+                    'engagement_score': 3
+                })
+            
+        except Exception as e:
+            print(f"⚠️  Error parsing AI suggestions: {e}")
+            # Fallback to basic suggestions
+            for i in range(clip_count):
+                suggestions.append({
+                    'clip_number': i + 1,
+                    'title': f'Engaging Clip {i + 1}',
+                    'key_phrase': 'AI-identified compelling moment',
+                    'engagement_reason': 'High potential for social media engagement',
+                    'estimated_start': i * 60,
+                    'recommended_duration': 30,
+                    'engagement_score': 5
+                })
+        
+        return suggestions
+    
+    def _create_clip_title(self, sentence: str, clip_num: int) -> str:
+        """Create engaging title from sentence content"""
+        sentence = sentence.strip()
+        
+        # Extract key concepts
+        words = sentence.lower().split()
+        
+        # Look for power words
+        power_words = ['secret', 'truth', 'mistake', 'wrong', 'right', 'best', 'worst', 'never', 'always', 'everyone', 'nobody']
+        title_words = []
+        
+        for word in words:
+            if word in power_words:
+                title_words.append(word.title())
+        
+        # If we found power words, build title around them
+        if title_words:
+            if 'secret' in sentence.lower():
+                return f"The Secret That {clip_num}"
+            elif 'mistake' in sentence.lower():
+                return f"Biggest Mistake #{clip_num}"
+            elif 'truth' in sentence.lower():
+                return f"Truth About This"
+            elif any(w in sentence.lower() for w in ['never', 'nobody']):
+                return f"Nobody Talks About This"
+        
+        # Fallback to sentence start
+        first_words = ' '.join(sentence.split()[:4])
+        return f"{first_words}..." if len(sentence.split()) > 4 else first_words
+    
+    def _explain_engagement(self, sentence: str) -> str:
+        """Explain why a moment is engaging"""
+        sentence_lower = sentence.lower()
+        
+        if '?' in sentence:
+            return "Questions drive curiosity and comments"
+        elif any(word in sentence_lower for word in ['secret', 'truth', 'reveal']):
+            return "Exclusive insights create shareability"
+        elif any(word in sentence_lower for w in ['mistake', 'wrong', 'error']):
+            return "Learning from mistakes resonates with audiences"
+        elif any(word in sentence_lower for word in ['you', 'your']):
+            return "Direct address increases personal connection"
+        else:
+            return "Compelling content with strong social media potential"
+    
+    def _detect_content_type(self, transcript: str) -> str:
+        """Detect the type of content from transcript"""
+        transcript_lower = transcript.lower()
+        
+        if any(word in transcript_lower for word in ['interview', 'conversation', 'talk', 'discussion']):
+            return 'interview'
+        elif any(word in transcript_lower for word in ['learn', 'teach', 'explain', 'tutorial', 'lesson']):
+            return 'educational'
+        elif any(word in transcript_lower for word in ['story', 'happened', 'experience', 'remember']):
+            return 'storytelling'
+        elif any(word in transcript_lower for word in ['business', 'strategy', 'marketing', 'sales']):
+            return 'business'
+        else:
+            return 'general'
     
     def _create_simple_analysis(self, video_path: str, preferences: Dict[str, Any]) -> Dict[str, Any]:
         """Create simple analysis without AI"""
@@ -398,37 +603,86 @@ class VideoEditingCopilot:
             'content_type': preferences.get('content_type', 'general'),
             'suggested_clips': []
         }
+        """Create simple analysis without AI"""
+        style = preferences.get('style', 'engaging')
+        clip_count = preferences.get('clip_count', 5)
+        
+        return {
+            'style': style,
+            'clip_count': clip_count,
+            'content_type': preferences.get('content_type', 'general'),
+            'suggested_clips': []
+        }
     
     def _plan_clips(self, video_path: str, analysis: Dict[str, Any], preferences: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """Plan clips based on analysis"""
+        """Plan clips based on analysis with improved accuracy"""
         clip_count = preferences.get('clip_count', analysis.get('clip_count', 5))
         style = preferences.get('style', analysis.get('style', 'engaging'))
         
         clips = []
         duration = self._get_video_duration(video_path)
         
-        # Create evenly spaced clips as fallback
-        segment_length = duration / (clip_count + 1)
+        # Use AI suggestions if available
+        ai_suggestions = analysis.get('suggested_clips', [])
         
-        for i in range(clip_count):
-            start_time = segment_length * (i + 1) - 30  # 30 seconds before segment
-            start_time = max(0, start_time)
+        if ai_suggestions:
+            print(f"🧠 Using AI-identified engaging moments...")
             
-            clip_length = random.uniform(
-                preferences.get('clip_length_min', 30),
-                preferences.get('clip_length_max', 60)
-            )
+            for i, suggestion in enumerate(ai_suggestions[:clip_count]):
+                # Use AI timing suggestions but validate them
+                suggested_start = suggestion.get('estimated_start', i * (duration / clip_count))
+                suggested_duration = suggestion.get('recommended_duration', 30)
+                
+                # Ensure valid timing
+                start_time = max(0, min(suggested_start, duration - suggested_duration - 1))
+                clip_duration = min(suggested_duration, duration - start_time - 1)
+                clip_duration = max(15, clip_duration)  # Minimum 15 seconds
+                
+                clip = {
+                    'clip_number': i + 1,
+                    'start_time': start_time,
+                    'duration': clip_duration,
+                    'title': suggestion.get('title', f"{style.title()} Moment {i + 1}"),
+                    'style': style,
+                    'output_path': f"output/clip_{i+1:02d}_{style}_{suggestion.get('engagement_score', 5)}.mp4",
+                    'engagement_score': suggestion.get('engagement_score', 5),
+                    'ai_reasoning': suggestion.get('engagement_reason', 'AI-identified engaging content'),
+                    'key_phrase': suggestion.get('key_phrase', 'Compelling moment')
+                }
+                clips.append(clip)
+                
+                print(f"   📱 Clip {i+1}: {clip['title']}")
+                print(f"      🎯 Key: {clip['key_phrase'][:60]}...")
+                print(f"      ⏰ {start_time:.1f}s - {start_time + clip_duration:.1f}s")
+        
+        else:
+            print(f"📊 Creating evenly distributed clips...")
+            # Fallback to evenly spaced clips with better distribution
+            segment_length = duration / (clip_count + 1)
             
-            clip = {
-                'clip_number': i + 1,
-                'start_time': start_time,
-                'duration': clip_length,
-                'title': f"{style.title()} Moment {i + 1}",
-                'style': style,
-                'output_path': f"output/clip_{i+1:02d}_{style}.mp4",
-                'engagement_score': round(random.uniform(7.0, 9.5), 1)
-            }
-            clips.append(clip)
+            for i in range(clip_count):
+                # Better distribution - avoid very beginning and end
+                start_time = segment_length * (i + 1) - 30
+                start_time = max(30, min(start_time, duration - 60))  # Keep away from edges
+                
+                clip_length = random.uniform(
+                    preferences.get('clip_length_min', 30),
+                    preferences.get('clip_length_max', 60)
+                )
+                
+                # Ensure clip fits in video
+                clip_length = min(clip_length, duration - start_time - 1)
+                
+                clip = {
+                    'clip_number': i + 1,
+                    'start_time': start_time,
+                    'duration': clip_length,
+                    'title': f"{style.title()} Moment {i + 1}",
+                    'style': style,
+                    'output_path': f"output/clip_{i+1:02d}_{style}.mp4",
+                    'engagement_score': round(random.uniform(6.0, 8.5), 1)
+                }
+                clips.append(clip)
         
         return clips
     
@@ -443,6 +697,7 @@ class VideoEditingCopilot:
             print("❌ MoviePy not available - cannot create actual clips")
             return clips
         
+        video = None
         try:
             from moviepy import VideoFileClip
             
@@ -454,6 +709,8 @@ class VideoEditingCopilot:
             print(f"📐 Size: {video.size}")
             
             for clip in clips:
+                clip_segment = None
+                clip_vertical = None
                 try:
                     start_time = clip['start_time']
                     duration = clip['duration']
@@ -461,48 +718,84 @@ class VideoEditingCopilot:
                     
                     print(f"✂️ Creating clip {clip['clip_number']}/{len(clips)}...")
                     
-                    # Extract the clip segment
+                    # Ensure start time is valid
+                    start_time = max(0, min(start_time, video.duration - 1))
                     end_time = min(start_time + duration, video.duration - 0.1)
+                    
+                    if end_time <= start_time:
+                        raise Exception(f"Invalid time range: {start_time}-{end_time}")
+                    
+                    # Extract the clip segment
                     clip_segment = video.subclipped(start_time, end_time)
+                    
+                    if clip_segment is None:
+                        raise Exception("Failed to create clip segment")
                     
                     # Convert to vertical format (9:16)
                     clip_vertical = self._make_vertical_clip(clip_segment)
                     
-                    # Save the clip
+                    if clip_vertical is None:
+                        raise Exception("Failed to convert to vertical format")
+                    
+                    # Save the clip with better error handling
                     print(f"💾 Saving: {os.path.basename(output_path)}")
+                    
+                    # Use safer write parameters
                     clip_vertical.write_videofile(
                         output_path,
                         codec='libx264',
-                        audio_codec='aac'
+                        audio_codec='aac',
+                        verbose=False,
+                        logger=None
                     )
+                    
+                    # Verify file was created
+                    if not os.path.exists(output_path):
+                        raise Exception("Output file was not created")
                     
                     # Update clip info
                     clip['created'] = True
-                    clip['file_size'] = os.path.getsize(output_path) if os.path.exists(output_path) else 0
+                    clip['file_size'] = os.path.getsize(output_path)
                     clip['actual_duration'] = clip_vertical.duration
                     
-                    # Clean up clip objects
-                    clip_segment.close()
-                    clip_vertical.close()
-                    
                     created_clips.append(clip)
+                    print(f"✅ Clip {clip['clip_number']} created successfully")
                     
                 except Exception as e:
                     print(f"❌ Error creating clip {clip['clip_number']}: {e}")
                     clip['created'] = False
                     clip['error'] = str(e)
                     created_clips.append(clip)
-            
-            # Clean up main video
-            video.close()
-            
+                
+                finally:
+                    # Always clean up clip objects to prevent memory leaks
+                    if clip_segment is not None:
+                        try:
+                            clip_segment.close()
+                        except:
+                            pass
+                    if clip_vertical is not None:
+                        try:
+                            clip_vertical.close()
+                        except:
+                            pass
+                    
         except Exception as e:
             print(f"❌ Error processing video: {e}")
-            # Return original clips with error info
+            # Return clips with error info
             for clip in clips:
-                clip['created'] = False
-                clip['error'] = str(e)
-            return clips
+                if clip not in created_clips:
+                    clip['created'] = False
+                    clip['error'] = str(e)
+                    created_clips.append(clip)
+        
+        finally:
+            # Always clean up main video
+            if video is not None:
+                try:
+                    video.close()
+                except:
+                    pass
         
         return created_clips
     
@@ -639,22 +932,27 @@ class VideoEditingCopilot:
         """Format response for successful video processing"""
         response = "🎉 **Video Processing Complete!**\n\n"
         
-        successful_clips = [c for c in clips if c.get('created', False)]
-        failed_clips = [c for c in clips if not c.get('created', True)]
+        successful_clips = [c for c in clips if c.get('output_path') and os.path.exists(c['output_path'])]
+        failed_clips = [c for c in clips if c not in successful_clips]
         
         if successful_clips:
             response += f"✅ **{len(successful_clips)} clips created successfully:**\n\n"
             
             for clip in successful_clips:
-                response += f"📱 **Clip {clip['clip_number']}**: {clip['title']}\n"
-                response += f"   • Duration: {clip['duration']} seconds\n"
-                response += f"   • File: {clip['output_path']}\n"
-                response += f"   • Size: {clip.get('file_size', 0) // 1024}KB\n\n"
+                size_kb = os.path.getsize(clip['output_path']) // 1024 if os.path.exists(clip.get('output_path', '')) else 0
+                response += f"📱 **Clip {clip.get('clip_number', '?')}**: {clip.get('title', 'Untitled')}\n"
+                response += f"   • Duration: {clip.get('duration', 0):.1f}s  ({clip.get('start_time', 0):.1f}s → {clip.get('end_time', 0):.1f}s)\n"
+                response += f"   • Hook: \"{clip.get('hook', '')}\"\n"
+                response += f"   • Engagement Score: {clip.get('engagement_score', 0):.1f}/10\n"
+                response += f"   • File: {clip['output_path']}  ({size_kb}KB)\n"
+                if clip.get('hashtags'):
+                    response += f"   • Tags: {' '.join(clip['hashtags'][:5])}\n"
+                response += "\n"
         
         if failed_clips:
             response += f"⚠️  **{len(failed_clips)} clips had issues:**\n"
             for clip in failed_clips:
-                response += f"   • Clip {clip['clip_number']}: {clip.get('error', 'Unknown error')}\n"
+                response += f"   • Clip {clip.get('clip_number', '?')}: {clip.get('error', 'Unknown error')}\n"
         
         response += "\n🚀 **Your clips are ready for social media!**\n"
         return response

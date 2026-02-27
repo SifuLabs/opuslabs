@@ -19,8 +19,8 @@ class Config:
         """Load configuration from environment and config files"""
         # Default configuration
         self.config = {
-            # API Keys
-            'google_api_key': os.getenv('GOOGLE_API_KEY'),
+            # API Keys — support both GEMINI_API_KEY and GOOGLE_API_KEY
+            'google_api_key': os.getenv('GEMINI_API_KEY') or os.getenv('GOOGLE_API_KEY'),
             'assemblyai_api_key': os.getenv('ASSEMBLYAI_API_KEY'),
             
             # Video Processing

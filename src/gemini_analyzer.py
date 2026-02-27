@@ -47,8 +47,8 @@ class GeminiTranscriptAnalyzer:
     """Enhanced transcript analysis using Gemini AI"""
     
     def __init__(self):
-        # Configure Gemini
-        api_key = os.getenv('GOOGLE_API_KEY')
+        # Support both GEMINI_API_KEY and GOOGLE_API_KEY (prefer GEMINI_API_KEY)
+        api_key = os.getenv('GEMINI_API_KEY') or os.getenv('GOOGLE_API_KEY')
         if api_key and GEMINI_AVAILABLE:
             genai.configure(api_key=api_key)
             self.model = genai.GenerativeModel('gemini-1.5-flash')
@@ -57,7 +57,7 @@ class GeminiTranscriptAnalyzer:
             if not GEMINI_AVAILABLE:
                 print("⚠️ Gemini not available. Using rule-based analysis only.")
             elif not api_key:
-                print("⚠️ No Gemini API key found. Using rule-based analysis only.")
+                print("⚠️ No Gemini API key found. Set GEMINI_API_KEY environment variable.")
             self.use_ai_analysis = False
         
         # Download NLTK data if needed
@@ -120,13 +120,16 @@ class GeminiTranscriptAnalyzer:
         max_length: int,
         style: str
     ) -> List[EngagingSegment]:
-        """Use Gemini AI for intelligent content analysis"""
+        """Use Gemini AI for intelligent content analysis with timestamped transcript"""
         try:
             print("🧠 Analyzing content with Gemini AI...")
             
-            # Create analysis prompt
+            # Build a timestamped transcript string so Gemini can return real timestamps
+            timestamped_transcript = self._build_timestamped_transcript(segments)
+            
+            # Create analysis prompt that includes actual timestamps
             prompt = self._create_analysis_prompt(
-                full_text, target_clips, min_length, max_length, style
+                timestamped_transcript, target_clips, min_length, max_length, style
             )
             
             # Get AI analysis
@@ -137,23 +140,40 @@ class GeminiTranscriptAnalyzer:
                 print("⚠️ AI analysis failed, falling back to rule-based")
                 return self._analyze_with_rules(segments, target_clips, min_length, max_length, style)
             
-            # Convert AI analysis to segments
-            return self._create_segments_from_ai_analysis(segments, ai_analysis, style)
+            # Convert AI analysis to segments using direct timestamps
+            result = self._create_segments_from_ai_analysis(segments, ai_analysis, style)
+            
+            if not result:
+                print("⚠️ No valid segments from AI, falling back to rule-based")
+                return self._analyze_with_rules(segments, target_clips, min_length, max_length, style)
+            
+            return result
             
         except Exception as e:
             print(f"❌ Gemini analysis failed: {e}")
             print("🔄 Falling back to rule-based analysis...")
             return self._analyze_with_rules(segments, target_clips, min_length, max_length, style)
+
+    def _build_timestamped_transcript(self, segments: List[Dict]) -> str:
+        """Build a transcript string with timestamps that Gemini can reference"""
+        lines = []
+        for seg in segments:
+            start = seg.get('start', 0)
+            end = seg.get('end', 0)
+            text = seg.get('text', '').strip()
+            if text:
+                lines.append(f"[{start:.2f}s - {end:.2f}s] {text}")
+        return '\n'.join(lines)
     
     def _create_analysis_prompt(
         self, 
-        text: str, 
+        timestamped_transcript: str, 
         target_clips: int, 
         min_length: int, 
         max_length: int, 
         style: str
     ) -> str:
-        """Create a detailed prompt for Gemini analysis"""
+        """Create a detailed prompt for Gemini using the timestamped transcript"""
         
         style_instructions = {
             'funny': 'Focus on humorous moments, jokes, funny stories, and comedic timing.',
@@ -167,100 +187,71 @@ class GeminiTranscriptAnalyzer:
         
         style_instruction = style_instructions.get(style, style_instructions['engaging'])
         
-        return f"""
-        Analyze this video transcript and identify the {target_clips} most engaging moments for social media clips.
+        return f"""You are an expert social media video editor. Analyze the timestamped transcript below and identify the {target_clips} best moments for short-form clips.
 
-        CONTENT ANALYSIS REQUIREMENTS:
-        - {style_instruction}
-        - Each clip should be {min_length}-{max_length} seconds long
-        - Look for natural conversation breaks and complete thoughts
-        - Identify strong hooks, emotional peaks, and memorable quotes
-        - Consider viral potential and social media appeal
+CONTENT STYLE: {style_instruction}
+CLIP LENGTH: Each clip must be {min_length}-{max_length} seconds long.
 
-        TRANSCRIPT:
-        {text}
+TIMESTAMPED TRANSCRIPT (format: [start_seconds - end_seconds] text):
+{timestamped_transcript}
 
-        OUTPUT FORMAT (JSON):
+INSTRUCTIONS:
+- Use the exact second values from the timestamps in the transcript above.
+- Each clip must start and end at timestamps that appear in the transcript.
+- Clips must not overlap each other.
+- Prefer clips that start with a strong hook and end on a satisfying note.
+- Choose moments with high engagement potential for social media.
+
+OUTPUT: Respond with ONLY valid JSON (no markdown, no explanation). Use this exact schema:
+{{
+    "engaging_moments": [
         {{
-            "engaging_moments": [
-                {{
-                    "title": "Catchy title for the clip",
-                    "hook": "The most compelling opening line or quote",
-                    "start_phrase": "First few words to identify timestamp",
-                    "end_phrase": "Last few words to identify timestamp", 
-                    "engagement_score": 8.5,
-                    "viral_potential": 7.2,
-                    "emotion": "funny/exciting/educational/surprising/inspiring",
-                    "segment_type": "hook/story/reveal/climax/question",
-                    "keywords": ["keyword1", "keyword2", "keyword3"],
-                    "hashtags": ["#tag1", "#tag2", "#tag3"],
-                    "reason": "Why this moment is engaging"
-                }}
-            ]
+            "title": "Punchy social-media title (max 10 words)",
+            "hook": "The most compelling sentence from this clip",
+            "start_time": 12.50,
+            "end_time": 54.30,
+            "engagement_score": 8.5,
+            "viral_potential": 7.2,
+            "emotion": "funny|exciting|educational|surprising|inspiring|emotional",
+            "segment_type": "hook|story|reveal|climax|question",
+            "keywords": ["keyword1", "keyword2", "keyword3"],
+            "hashtags": ["#tag1", "#tag2", "#tag3"],
+            "reason": "One sentence explaining why this moment is engaging"
         }}
+    ]
+}}
 
-        IMPORTANT:
-        - Provide exactly {target_clips} moments
-        - Ensure moments don't overlap
-        - Use actual quotes from the transcript
-        - Score engagement 1-10 and viral potential 1-10
-        - Make titles punchy and social media friendly
-        - Choose hashtags relevant to the content
-        """
+IMPORTANT:
+- start_time and end_time MUST be exact float values from the transcript timestamps.
+- Provide exactly {target_clips} moments with no overlaps.
+- Score engagement_score and viral_potential from 1.0 to 10.0.
+"""
     
     def _parse_gemini_analysis(self, response_text: str) -> Optional[Dict[str, Any]]:
-        """Parse Gemini's analysis response"""
+        """Parse Gemini's JSON analysis response"""
         try:
-            # Try to extract JSON from the response
-            import json
+            # Strip markdown code fences if present
+            cleaned = response_text.strip()
+            if cleaned.startswith('```'):
+                cleaned = re.sub(r'^```[a-zA-Z]*\n?', '', cleaned)
+                cleaned = re.sub(r'\n?```$', '', cleaned)
+                cleaned = cleaned.strip()
             
-            # Look for JSON block
-            json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+            # Try direct JSON parse first
+            try:
+                return json.loads(cleaned)
+            except json.JSONDecodeError:
+                pass
+            
+            # Look for JSON object in the response
+            json_match = re.search(r'\{.*\}', cleaned, re.DOTALL)
             if json_match:
                 return json.loads(json_match.group())
             
-            # If no JSON found, try to parse structured text
-            return self._parse_structured_text(response_text)
+            return None
             
         except Exception as e:
             print(f"❌ Failed to parse Gemini response: {e}")
-            return None
-    
-    def _parse_structured_text(self, text: str) -> Optional[Dict[str, Any]]:
-        """Parse structured text response when JSON fails"""
-        try:
-            # Look for patterns in the response
-            moments = []
-            
-            # Split by numbered items or clear separators
-            sections = re.split(r'\n(?=\d+\.|\*|\-)', text)
-            
-            for section in sections:
-                if len(section.strip()) < 50:  # Skip short sections
-                    continue
-                
-                # Extract key information using regex
-                title_match = re.search(r'title[:\s]*(.+?)(?:\n|$)', section, re.IGNORECASE)
-                hook_match = re.search(r'hook[:\s]*(.+?)(?:\n|$)', section, re.IGNORECASE)
-                
-                if title_match or hook_match:
-                    moment = {
-                        'title': title_match.group(1).strip() if title_match else f"Engaging Moment {len(moments)+1}",
-                        'hook': hook_match.group(1).strip() if hook_match else section[:100] + "...",
-                        'engagement_score': 7.0,  # Default
-                        'viral_potential': 6.0,   # Default
-                        'emotion': 'engaging',    # Default
-                        'segment_type': 'hook',   # Default
-                        'keywords': [],           # Will be filled later
-                        'hashtags': ['#viral', '#shorts', '#content'],
-                        'reason': 'AI identified as engaging content'
-                    }
-                    moments.append(moment)
-            
-            return {'engaging_moments': moments} if moments else None
-            
-        except Exception as e:
-            print(f"❌ Text parsing failed: {e}")
             return None
     
     def _create_segments_from_ai_analysis(
@@ -269,24 +260,39 @@ class GeminiTranscriptAnalyzer:
         ai_analysis: Dict[str, Any],
         style: str
     ) -> List[EngagingSegment]:
-        """Convert AI analysis to EngagingSegment objects"""
+        """Convert AI analysis to EngagingSegment objects using direct timestamps"""
         
         engaging_moments = ai_analysis.get('engaging_moments', [])
         if not engaging_moments:
             return []
         
+        max_video_time = segments[-1]['end'] if segments else 0
         result_segments = []
         
         for moment in engaging_moments:
-            # Find matching segments based on text content
-            start_time, end_time = self._find_segment_timestamps(
-                segments, moment.get('start_phrase', ''), moment.get('end_phrase', ''), moment.get('hook', '')
-            )
+            # Use direct timestamps from Gemini response
+            start_time = moment.get('start_time')
+            end_time = moment.get('end_time')
             
             if start_time is None or end_time is None:
+                print(f"⚠️ Skipping moment '{moment.get('title', '?')}' — missing timestamps")
                 continue
             
-            # Get text for this segment
+            try:
+                start_time = float(start_time)
+                end_time = float(end_time)
+            except (TypeError, ValueError):
+                print(f"⚠️ Skipping moment '{moment.get('title', '?')}' — invalid timestamps")
+                continue
+            
+            # Snap timestamps to nearest real segment boundary for accuracy
+            start_time = self._snap_to_segment(segments, start_time, 'start')
+            end_time = self._snap_to_segment(segments, end_time, 'end')
+            
+            # Clamp to video bounds
+            start_time = max(0.0, min(start_time, max_video_time))
+            end_time = max(start_time + 5.0, min(end_time, max_video_time))
+            
             segment_text = self._extract_text_for_timerange(segments, start_time, end_time)
             
             engaging_segment = EngagingSegment(
@@ -306,59 +312,19 @@ class GeminiTranscriptAnalyzer:
             result_segments.append(engaging_segment)
         
         return result_segments
-    
-    def _find_segment_timestamps(
-        self, 
-        segments: List[Dict], 
-        start_phrase: str, 
-        end_phrase: str, 
-        hook: str
-    ) -> tuple[Optional[float], Optional[float]]:
-        """Find timestamps for segments based on text phrases"""
+
+    def _snap_to_segment(self, segments: List[Dict], time: float, boundary: str) -> float:
+        """Snap a time value to the nearest real segment start or end boundary"""
+        if not segments:
+            return time
         
-        # Combine all segments text with timestamps
-        full_segments_text = [(seg['start'], seg['end'], seg['text'].lower()) for seg in segments]
+        key = 'start' if boundary == 'start' else 'end'
+        closest = min(segments, key=lambda s: abs(s[key] - time))
         
-        start_time = None
-        end_time = None
-        
-        # Look for start phrase or hook
-        search_phrases = [p.lower().strip() for p in [start_phrase, hook] if p.strip()]
-        
-        for phrase in search_phrases:
-            if len(phrase) < 10:  # Skip very short phrases
-                continue
-                
-            for seg_start, seg_end, seg_text in full_segments_text:
-                if phrase[:20] in seg_text or seg_text[:20] in phrase:
-                    start_time = seg_start
-                    break
-            
-            if start_time is not None:
-                break
-        
-        # If no start found, use first segment
-        if start_time is None and segments:
-            start_time = segments[0]['start']
-        
-        # Look for end phrase or estimate based on length
-        if end_phrase and len(end_phrase.strip()) > 10:
-            end_phrase_lower = end_phrase.lower().strip()
-            for seg_start, seg_end, seg_text in full_segments_text:
-                if seg_start > start_time and (end_phrase_lower[:20] in seg_text or seg_text[:20] in end_phrase_lower):
-                    end_time = seg_end
-                    break
-        
-        # If no end found, estimate 45 seconds from start
-        if end_time is None and start_time is not None:
-            end_time = start_time + 45  # Default 45 second clip
-            
-            # Adjust to not exceed available segments
-            if segments:
-                max_end = segments[-1]['end']
-                end_time = min(end_time, max_end)
-        
-        return start_time, end_time
+        # Only snap if within 3 seconds of a real boundary
+        if abs(closest[key] - time) <= 3.0:
+            return closest[key]
+        return time
     
     def _extract_text_for_timerange(self, segments: List[Dict], start_time: float, end_time: float) -> str:
         """Extract text for a specific time range"""
