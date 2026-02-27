@@ -88,20 +88,35 @@ class GeminiTranscriptAnalyzer:
         if self._cache_enabled:
             CACHE_DIR.mkdir(parents=True, exist_ok=True)
         
-        # Download NLTK data if needed
+        # Download NLTK data if needed, with graceful fallback
         if NLTK_AVAILABLE:
-            try:
-                nltk.data.find('tokenizers/punkt')
-            except LookupError:
+            # Newer NLTK uses punkt_tab; older versions use punkt.
+            for resource in ('tokenizers/punkt_tab', 'tokenizers/punkt'):
+                try:
+                    nltk.data.find(resource)
+                    break
+                except LookupError:
+                    pass
+            else:
+                # Neither found — try to download both silently
+                nltk.download('punkt_tab', quiet=True)
                 nltk.download('punkt', quiet=True)
-            
-            from nltk.tokenize import sent_tokenize, word_tokenize
-            self.sent_tokenize = sent_tokenize
-            self.word_tokenize = word_tokenize
+
+            try:
+                from nltk.tokenize import sent_tokenize, word_tokenize
+                # Smoke-test so we catch missing data early
+                word_tokenize('test')
+                self.sent_tokenize = sent_tokenize
+                self.word_tokenize = word_tokenize
+            except Exception:
+                # NLTK data still missing — fall back to regex tokenisers
+                NLTK_AVAILABLE_local = False
+                self.sent_tokenize = lambda text: re.split(r'(?<=[.!?])\s+', text)
+                self.word_tokenize = lambda text: re.findall(r"[a-zA-Z']+", text)
         else:
             # Simple fallback tokenizers
-            self.sent_tokenize = lambda text: text.split('. ')
-            self.word_tokenize = lambda text: text.split()
+            self.sent_tokenize = lambda text: re.split(r'(?<=[.!?])\s+', text)
+            self.word_tokenize = lambda text: re.findall(r"[a-zA-Z']+", text)
     
     def find_engaging_moments(
         self, 
@@ -201,7 +216,8 @@ class GeminiTranscriptAnalyzer:
                 print(f"❌ Gemini call failed: {e}")
                 if is_rate_limit:
                     print("   Tip: the result is cached after a successful run, so retries won't cost extra.")
-                    print(f"   Or set GEMINI_MODEL=gemini-2.0-flash-lite in .env for higher free-tier limits.")
+                    print(f"   Or set GEMINI_MODEL=gemini-2.0-flash-lite in your .env for higher free-tier limits.")
+                    print(f"   Current model: {DEFAULT_MODEL}")
                 return None
         return None
 

@@ -54,41 +54,77 @@ class VideoProcessor:
             print("Loading speech recognition model...")
             self.whisper_model = whisper.load_model("base")
     
-    def download_video(self, url: str) -> Optional[str]:
+    def download_video(self, url: str, cookies_from_browser: Optional[str] = None) -> Optional[str]:
         """
         Download video from URL (YouTube, etc.)
         
         Args:
             url: Video URL
+            cookies_from_browser: Browser name to pull cookies from (e.g. 'chrome', 'firefox',
+                                  'edge', 'brave'). If None, tries common browsers automatically.
             
         Returns:
             Path to downloaded video file or None if failed
         """
-        try:
-            output_path = os.path.join(self.temp_dir, "downloaded_video.%(ext)s")
-            
-            ydl_opts = {
-                'outtmpl': output_path,
-                'format': 'best[height<=720]',  # Limit quality for faster processing
-                'extractaudio': False,
-            }
-            
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                video_title = info.get('title', 'Unknown')
-                
+        output_path = os.path.join(self.temp_dir, "downloaded_video.%(ext)s")
+
+        base_opts = {
+            'outtmpl': output_path,
+            'format': 'best[height<=720]',  # Limit quality for faster processing
+            'extractaudio': False,
+        }
+
+        # Build a list of option sets to try in order.
+        # Each set extends base_opts with (possibly) different cookie sources.
+        browsers_to_try = [cookies_from_browser] if cookies_from_browser else ['chrome', 'firefox', 'edge', 'brave']
+        attempts = [dict(base_opts, cookiesfrombrowser=(b,)) for b in browsers_to_try]
+        # Final fallback: no cookies at all (may still work for some videos)
+        attempts.append(base_opts)
+
+        # Clean up any leftover file from a previous run
+        for f in os.listdir(self.temp_dir):
+            if f.startswith("downloaded_video."):
+                try:
+                    os.remove(os.path.join(self.temp_dir, f))
+                except OSError:
+                    pass
+
+        last_error = None
+        for opts in attempts:
+            browser = opts.get('cookiesfrombrowser', (None,))[0]
+            try:
+                if browser:
+                    print(f"🍪 Trying cookies from {browser}...")
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info = ydl.extract_info(url, download=True)
+                    video_title = info.get('title', 'Unknown')
+
                 # Find the actual downloaded file
                 for file in os.listdir(self.temp_dir):
                     if file.startswith("downloaded_video."):
                         downloaded_path = os.path.join(self.temp_dir, file)
                         print(f"✅ Downloaded: {video_title}")
                         return downloaded_path
-                        
-            return None
-            
-        except Exception as e:
-            print(f"❌ Failed to download video: {e}")
-            return None
+
+                return None
+
+            except yt_dlp.utils.DownloadError as e:
+                last_error = e
+                err_msg = str(e)
+                # Only keep trying if it's a bot-detection / cookie error
+                if 'Sign in' in err_msg or 'bot' in err_msg.lower() or 'cookies' in err_msg.lower():
+                    if browser:
+                        print(f"   ⚠️  {browser} cookies didn't work, trying next...")
+                    continue
+                # Any other download error is fatal — don't retry
+                break
+
+        print(f"❌ Download failed: {last_error}")
+        if last_error and ('Sign in' in str(last_error) or 'bot' in str(last_error).lower()):
+            print("💡 YouTube bot-detection triggered. Make sure you are signed into YouTube")
+            print("   in Chrome, Firefox, Edge, or Brave, then re-run.")
+            print("   Alternatively, export cookies manually and pass --cookies cookies.txt")
+        return None
     
     def validate_video_file(self, video_path: str) -> bool:
         """
