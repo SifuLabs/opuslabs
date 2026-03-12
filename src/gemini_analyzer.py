@@ -64,6 +64,13 @@ class EngagingSegment:
     hashtags: List[str]
     emotion: str  # 'funny', 'exciting', 'educational', 'surprising'
     viral_potential: float
+    # Per-word timing for karaoke-style captions (populated when Whisper
+    # word_timestamps=True was used; empty list otherwise)
+    word_segments: List[Dict] = None
+
+    def __post_init__(self):
+        if self.word_segments is None:
+            self.word_segments = []
 
 class GeminiTranscriptAnalyzer:
     """Enhanced transcript analysis using Gemini AI"""
@@ -445,7 +452,8 @@ IMPORTANT:
             end_time = max(start_time + 5.0, min(end_time, max_video_time))
             
             segment_text = self._extract_text_for_timerange(segments, start_time, end_time)
-            
+            word_segs   = self._extract_words_for_timerange(segments, start_time, end_time)
+
             engaging_segment = EngagingSegment(
                 start_time=start_time,
                 end_time=end_time,
@@ -457,7 +465,8 @@ IMPORTANT:
                 suggested_title=moment.get('title', f'Clip {len(result_segments)+1}'),
                 hashtags=moment.get('hashtags', ['#viral', '#shorts']),
                 emotion=moment.get('emotion', 'engaging'),
-                viral_potential=float(moment.get('viral_potential', 6.0))
+                viral_potential=float(moment.get('viral_potential', 6.0)),
+                word_segments=word_segs,
             )
             
             result_segments.append(engaging_segment)
@@ -480,111 +489,164 @@ IMPORTANT:
     def _extract_text_for_timerange(self, segments: List[Dict], start_time: float, end_time: float) -> str:
         """Extract text for a specific time range"""
         texts = []
-        
         for segment in segments:
-            seg_start = segment['start']
-            seg_end = segment['end']
-            
-            # Check if segment overlaps with our range
-            if seg_end >= start_time and seg_start <= end_time:
+            if segment['end'] >= start_time and segment['start'] <= end_time:
                 texts.append(segment['text'].strip())
-        
         return ' '.join(texts)
+
+    def _extract_words_for_timerange(
+        self, segments: List[Dict], start_time: float, end_time: float
+    ) -> List[Dict]:
+        """Collect per-word timing entries that fall within the clip time range."""
+        words: List[Dict] = []
+        for seg in segments:
+            if seg['end'] < start_time or seg['start'] > end_time:
+                continue
+            for w in seg.get('words', []):
+                w_start = float(w.get('start', seg['start']))
+                w_end   = float(w.get('end',   seg['end']))
+                if w_end >= start_time and w_start <= end_time:
+                    words.append({
+                        'word':  w.get('word', '').strip(),
+                        'start': w_start,
+                        'end':   w_end,
+                    })
+        return words
     
     def _analyze_with_rules(
-        self, 
-        segments: List[Dict], 
+        self,
+        segments: List[Dict],
         target_clips: int,
         min_length: int,
         max_length: int,
         style: str
     ) -> List[EngagingSegment]:
         """Fallback rule-based analysis"""
-        
+
         print("🔧 Using rule-based content analysis...")
-        
-        # Simple rule-based scoring
-        scored_segments = []
-        
-        for i, segment in enumerate(segments):
-            text = segment['text'].lower()
-            
-            # Basic engagement scoring
-            score = 0
-            
-            # Question bonus
-            if '?' in text:
-                score += 2
-            
-            # Excitement words
-            excitement_words = ['amazing', 'incredible', 'wow', 'unbelievable', 'shocking']
-            score += sum(2 for word in excitement_words if word in text)
-            
-            # Style-specific scoring
-            if style == 'funny' and any(word in text for word in ['funny', 'laugh', 'joke', 'hilarious']):
-                score += 3
-            elif style == 'educational' and any(word in text for word in ['learn', 'understand', 'because']):
-                score += 2
-            
-            # Length bonus (prefer medium length)
-            word_count = len(text.split())
-            if 20 <= word_count <= 50:
+
+        if not segments:
+            print("⚠️  No transcript segments available.")
+            return []
+
+        # ------------------------------------------------------------------ #
+        # Score every segment                                                  #
+        # ------------------------------------------------------------------ #
+        excitement_words = {
+            'amazing', 'incredible', 'wow', 'unbelievable', 'shocking',
+            'never', 'always', 'everyone', 'secret', 'truth', 'actually',
+            'important', 'key', 'critical', 'massive', 'huge',
+        }
+        style_words = {
+            'funny':       {'funny', 'laugh', 'joke', 'hilarious', 'lol'},
+            'educational': {'learn', 'understand', 'because', 'explain', 'means', 'shows'},
+            'energetic':   {'incredible', 'amazing', 'lets', 'go', 'power', 'strong'},
+            'emotional':   {'feel', 'heart', 'love', 'miss', 'proud', 'tears', 'story'},
+            'viral':       {'secret', 'truth', 'nobody', 'everyone', 'never', 'always'},
+        }
+
+        seg_scores: List[Dict] = []
+        for i, seg in enumerate(segments):
+            text = seg.get('text', '').lower()
+            score = 0.0
+            score += text.count('?') * 2
+            score += sum(2 for w in excitement_words if w in text)
+            for w in style_words.get(style, set()):
+                if w in text:
+                    score += 3
+            wc = len(text.split())
+            if 15 <= wc <= 60:
                 score += 1
-            
-            scored_segments.append({
-                'index': i,
-                'score': score,
-                'segment': segment,
-                'text': segment['text']
-            })
-        
-        # Sort by score and select top segments
-        scored_segments.sort(key=lambda x: x['score'], reverse=True)
-        
-        # Create engaging segments
-        result_segments = []
-        used_indices = set()
-        
-        for scored in scored_segments[:target_clips * 2]:  # Get more options
-            if scored['index'] in used_indices:
+            seg_scores.append({'index': i, 'score': score, 'text': seg.get('text', '')})
+
+        seg_scores.sort(key=lambda x: x['score'], reverse=True)
+
+        # ------------------------------------------------------------------ #
+        # Build clips by expanding a window around the best-scored segment    #
+        # until the clip reaches min_length (capped at max_length).           #
+        # ------------------------------------------------------------------ #
+        total_video_duration = segments[-1]['end'] - segments[0]['start']
+        # Relax min_length if the whole video is shorter
+        effective_min = min(min_length, total_video_duration * 0.5)
+
+        result_segments: List[EngagingSegment] = []
+        used_indices: set = set()
+
+        # Try every scored candidate (not just top target_clips*2) so we fill
+        # the requested clip count even for low-scored or short videos.
+        for scored in seg_scores:
+            if len(result_segments) >= target_clips:
+                break
+            center = scored['index']
+            if center in used_indices:
                 continue
-            
-            # Create a clip around this segment
-            start_idx = max(0, scored['index'] - 1)
-            end_idx = min(len(segments) - 1, scored['index'] + 3)
-            
-            start_time = segments[start_idx]['start']
-            end_time = segments[end_idx]['end']
-            duration = end_time - start_time
-            
-            # Check duration constraints
-            if min_length <= duration <= max_length:
-                # Mark indices as used
-                for idx in range(start_idx, end_idx + 1):
-                    used_indices.add(idx)
-                
-                # Extract text
-                clip_text = ' '.join([segments[idx]['text'] for idx in range(start_idx, end_idx + 1)])
-                
-                segment = EngagingSegment(
-                    start_time=start_time,
-                    end_time=end_time,
-                    text=clip_text,
-                    hook=scored['text'][:100] + "..." if len(scored['text']) > 100 else scored['text'],
-                    engagement_score=min(scored['score'], 10),
-                    segment_type='hook',
-                    keywords=self._extract_simple_keywords(clip_text),
-                    suggested_title=f"Engaging Moment {len(result_segments) + 1}",
-                    hashtags=['#viral', '#shorts', '#content'],
-                    emotion=style,
-                    viral_potential=min(scored['score'] * 0.8, 10)
-                )
-                
-                result_segments.append(segment)
-                
-                if len(result_segments) >= target_clips:
+
+            # Expand left and right until we reach effective_min or max_length
+            lo, hi = center, center
+            while True:
+                dur = segments[hi]['end'] - segments[lo]['start']
+                if dur >= effective_min:
                     break
-        
+                # Prefer expanding toward whichever end gives more time
+                can_left  = lo > 0 and all(i not in used_indices for i in range(lo - 1, lo))
+                can_right = hi < len(segments) - 1 and all(i not in used_indices for i in range(hi + 1, hi + 2))
+                if not can_left and not can_right:
+                    break
+                left_gain  = (segments[lo]['start'] - segments[lo - 1]['start']) if can_left  else 0
+                right_gain = (segments[hi + 1]['end'] - segments[hi]['end'])      if can_right else 0
+                if can_right and right_gain >= left_gain:
+                    hi += 1
+                elif can_left:
+                    lo -= 1
+                else:
+                    hi += 1
+
+            # Trim from the right if we went over max_length
+            while hi > lo and (segments[hi]['end'] - segments[lo]['start']) > max_length:
+                hi -= 1
+
+            start_time = segments[lo]['start']
+            end_time   = segments[hi]['end']
+            duration   = end_time - start_time
+
+            # Accept the clip if it's at least half of effective_min
+            if duration < effective_min * 0.5:
+                continue
+
+            # Avoid clips that heavily overlap a previously chosen clip
+            overlap = any(
+                not (end_time <= segments[segments.index(
+                        next((s for s in segments if s['start'] == rs.start_time), segments[0]))
+                    ]['start'] or
+                    start_time >= rs.end_time)
+                for rs in result_segments
+            )
+            # Simpler non-overlap check via used_indices
+            window_indices = set(range(lo, hi + 1))
+            if window_indices & used_indices:
+                continue
+
+            for idx in window_indices:
+                used_indices.add(idx)
+
+            clip_text  = ' '.join(segments[idx]['text'] for idx in range(lo, hi + 1))
+            clip_words = self._extract_words_for_timerange(segments, start_time, end_time)
+            hook_text  = scored['text']
+            result_segments.append(EngagingSegment(
+                start_time=start_time,
+                end_time=end_time,
+                text=clip_text,
+                hook=(hook_text[:100] + '…') if len(hook_text) > 100 else hook_text,
+                engagement_score=min(max(scored['score'], 1.0), 10.0),
+                segment_type='hook',
+                keywords=self._extract_simple_keywords(clip_text),
+                suggested_title=f"Engaging Moment {len(result_segments) + 1}",
+                hashtags=['#viral', '#shorts', '#content'],
+                emotion=style,
+                viral_potential=min(max(scored['score'] * 0.8, 1.0), 10.0),
+                word_segments=clip_words,
+            ))
+
         print(f"✅ Found {len(result_segments)} engaging moments using rule-based analysis")
         return result_segments
     

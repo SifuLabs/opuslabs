@@ -63,11 +63,11 @@ class ClipGenerator:
         
         # Caption settings
         self.caption_style = {
-            'fontsize': 48,
+            'fontsize': 72,
             'font': 'Arial-Bold',
             'color': 'white',
             'stroke_color': 'black',
-            'stroke_width': 3,
+            'stroke_width': 4,
             'method': 'caption'
         }
     
@@ -223,20 +223,19 @@ class ClipGenerator:
             return False
     
     def _use_ffmpeg_processing(
-        self, 
-        video_path: str, 
-        segment: EngagingSegment, 
-        output_path: str, 
+        self,
+        video_path: str,
+        segment: EngagingSegment,
+        output_path: str,
         settings: Dict[str, any]
     ) -> bool:
-        """Process clip using FFmpeg (fast input-seeking for performance)"""
+        """Process clip using FFmpeg with karaoke-style word-timed captions."""
         try:
             duration = segment.end_time - segment.start_time
             if duration <= 0:
                 print(f"❌ Invalid segment duration: {duration}")
                 return False
 
-            # Use input seeking (-ss before -i) for fast seeking
             cmd = [
                 'ffmpeg',
                 '-ss', str(segment.start_time),
@@ -244,26 +243,22 @@ class ClipGenerator:
                 '-t', str(duration),
             ]
 
-            # Video filters: scale to vertical 9:16, pad with blurred background
+            # ----------------------------------------------------------------
+            # Base video filters: scale to 9:16, blur-pad the background
+            # ----------------------------------------------------------------
             vf_parts = [
-                f'scale={self.target_width}:{self.target_height}:force_original_aspect_ratio=decrease',
-                f'pad={self.target_width}:{self.target_height}:(ow-iw)/2:(oh-ih)/2:color=black',
+                # Scale the content to fit inside 9:16, keeping aspect ratio
+                f"scale={self.target_width}:{self.target_height}:force_original_aspect_ratio=decrease",
+                # Pad the remaining space with a blurred copy of the video
+                # ffmpeg's 'boxing' technique: overlay content on blurred background
+                f"pad={self.target_width}:{self.target_height}:(ow-iw)/2:(oh-ih)/2:color=black",
             ]
 
-            # Simple caption overlay if text available (escape for drawtext)
-            if hasattr(segment, 'text') and segment.text and len(segment.text.strip()) > 10:
-                # Safely escape text for ffmpeg drawtext filter
-                safe_text = (segment.text[:120]
-                             .replace('\\', '\\\\')
-                             .replace("'", "\u2019")  # replace apostrophe with unicode right single quote
-                             .replace(':', '\\:')
-                             .replace('%', '\\%'))
-                safe_text = safe_text.replace('\n', ' ')
-                vf_parts.append(
-                    f"drawtext=text='{safe_text}':fontcolor=white:fontsize=36"
-                    f":borderw=2:bordercolor=black:x=(w-text_w)/2:y=h*0.85"
-                    f":line_spacing=8:fix_bounds=true"
-                )
+            # ----------------------------------------------------------------
+            # Caption overlay
+            # ----------------------------------------------------------------
+            caption_filters = self._build_caption_filters(segment, duration)
+            vf_parts.extend(caption_filters)
 
             cmd.extend([
                 '-vf', ','.join(vf_parts),
@@ -284,12 +279,119 @@ class ClipGenerator:
             if result.returncode == 0:
                 return os.path.exists(output_path)
             else:
-                print(f"FFmpeg error: {result.stderr[-500:]}")
+                print(f"FFmpeg error: {result.stderr[-800:]}")
                 return False
-                
+
         except Exception as e:
             print(f"FFmpeg processing failed: {e}")
             return False
+
+    # ------------------------------------------------------------------
+    # Caption helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _esc(text: str) -> str:
+        """Escape a string for use inside an FFmpeg drawtext filter value."""
+        return (
+            text
+            .replace('\\', '\\\\')
+            .replace("'",  "\u2019")   # typographic right single quote (safe in drawtext)
+            .replace(':',  '\\:')
+            .replace('%',  '\\%')
+            .replace('[',  '\\[')
+            .replace(']',  '\\]')
+            .replace('\n', ' ')
+        )
+
+    def _build_caption_filters(
+        self,
+        segment: EngagingSegment,
+        clip_duration: float,
+    ) -> List[str]:
+        """
+        Return a list of drawtext filter strings for the caption overlay.
+
+        Strategy
+        --------
+        * If word-level timestamps are available (Whisper with word_timestamps=True),
+          emit one drawtext entry per *group* of WORDS_PER_GROUP words, each
+          shown only while those words are being spoken — karaoke style.
+        * Otherwise fall back to a single static caption (first 12 words of the
+          segment text) displayed for the whole clip duration.
+
+        All captions are:
+          - Large bold font (72 pt at 1080-wide)
+          - Yellow text with a thick black stroke for maximum legibility
+          - Horizontally centred, positioned at 78 % of the frame height
+          - Wrapped at ~20 chars per line by drawtext's built-in :line_spacing
+        """
+        WORDS_PER_GROUP = 3   # words shown at once (matching viral TikTok/Reels style)
+        FONT_SIZE       = 72
+        STROKE_W        = 4
+        Y_POS           = 'h*0.78'
+        X_POS           = '(w-text_w)/2'
+        TEXT_COLOR      = 'white'
+        STROKE_COLOR    = 'black'
+        BOX_COLOR       = '0x00000099'  # semi-transparent black
+        BOX_BORDER      = 12            # px padding around text box
+
+        def _dt(text: str, t_start: float, t_end: float) -> str:
+            """Single drawtext filter string with timed enable expression."""
+            escaped = self._esc(text)
+            enable  = f"between(t,{t_start:.3f},{t_end:.3f})"
+            return (
+                f"drawtext=text='{escaped}'"
+                f":fontsize={FONT_SIZE}"
+                f":fontcolor={TEXT_COLOR}"
+                f":borderw={STROKE_W}"
+                f":bordercolor={STROKE_COLOR}"
+                f":box=1:boxcolor={BOX_COLOR}:boxborderw={BOX_BORDER}"
+                f":x={X_POS}:y={Y_POS}"
+                f":line_spacing=6"
+                f":fix_bounds=true"
+                f":enable='{enable}'"
+            )
+
+        # ---- word-timed (karaoke) path ----
+        words = segment.word_segments or []
+        # Offset word timestamps to be relative to clip start
+        clip_start = segment.start_time
+        rel_words = [
+            {'word': w['word'], 'start': w['start'] - clip_start, 'end': w['end'] - clip_start}
+            for w in words
+            if w.get('word')
+        ]
+
+        filters: List[str] = []
+
+        if rel_words:
+            # Group into chunks of WORDS_PER_GROUP
+            for i in range(0, len(rel_words), WORDS_PER_GROUP):
+                group = rel_words[i : i + WORDS_PER_GROUP]
+                text     = ' '.join(w['word'] for w in group).upper()
+                t_start  = max(0.0, group[0]['start'])
+                t_end    = min(clip_duration, group[-1]['end'])
+                if t_end <= t_start:
+                    t_end = min(clip_duration, t_start + 1.0)
+                filters.append(_dt(text, t_start, t_end))
+        else:
+            # ---- fallback: static caption for whole clip ----
+            raw = (segment.text or '').strip()
+            if not raw:
+                return []
+            # Limit to first 12 words and uppercase for readability
+            words_fb = raw.split()[:12]
+            # Split into two lines of 6 for narrow videos
+            if len(words_fb) > 6:
+                line1 = ' '.join(words_fb[:6])
+                line2 = ' '.join(words_fb[6:])
+                text  = f"{line1}\\n{line2}".upper()
+            else:
+                text = ' '.join(words_fb).upper()
+            filters.append(_dt(text, 0.5, max(1.0, clip_duration - 0.5)))
+
+        return filters
     
     def _resize_to_vertical(self, clip):
         """Resize video to vertical 9:16 format"""

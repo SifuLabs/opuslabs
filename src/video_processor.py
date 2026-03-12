@@ -271,8 +271,23 @@ class VideoProcessor:
             self._load_whisper_model()
             
             print("🎤 Transcribing audio (this may take a few minutes)...")
-            result = self.whisper_model.transcribe(video_path, verbose=False)
-            
+            result = self.whisper_model.transcribe(
+                video_path, verbose=False, word_timestamps=True
+            )
+
+            def _words_for_segment(seg) -> List[Dict]:
+                """Extract word-level entries from a Whisper segment dict."""
+                words = seg.get('words', [])
+                return [
+                    {
+                        'word': w.get('word', '').strip(),
+                        'start': float(w.get('start', seg['start'])),
+                        'end': float(w.get('end', seg['end'])),
+                    }
+                    for w in words
+                    if w.get('word', '').strip()
+                ]
+
             # Format transcript data
             transcript_data = {
                 'text': result['text'],
@@ -281,7 +296,8 @@ class VideoProcessor:
                         'start': segment['start'],
                         'end': segment['end'],
                         'text': segment['text'].strip(),
-                        'confidence': getattr(segment, 'confidence', 0.9)  # Whisper doesn't always provide confidence
+                        'confidence': getattr(segment, 'confidence', 0.9),
+                        'words': _words_for_segment(segment),
                     }
                     for segment in result['segments']
                 ],
