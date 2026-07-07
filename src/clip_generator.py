@@ -46,6 +46,7 @@ except ImportError:
     CV2_AVAILABLE = False
 
 from .gemini_analyzer import EngagingSegment
+from .content_strategy import ContentStrategyBuilder
 
 class ClipGenerator:
     """Generates video clips from engaging segments"""
@@ -60,6 +61,7 @@ class ClipGenerator:
         self.target_width = int(os.getenv('OUTPUT_WIDTH', 1080))
         self.target_height = int(os.getenv('OUTPUT_HEIGHT', 1920))
         self.target_fps = int(os.getenv('OUTPUT_FPS', 30))
+        self.content_strategy = ContentStrategyBuilder()
         
         # Caption settings
         self.caption_style = {
@@ -135,7 +137,7 @@ class ClipGenerator:
             # Get clip duration
             duration = segment.end_time - segment.start_time
             
-            return {
+            clip_info = {
                 'clip_number': clip_number,
                 'title': segment.suggested_title,
                 'hook': segment.hook,
@@ -148,6 +150,11 @@ class ClipGenerator:
                 'start_time': segment.start_time,
                 'end_time': segment.end_time
             }
+            clip_info['content_package'] = self.content_strategy.build_for_clip(
+                clip_info,
+                settings
+            )
+            return clip_info
             
         except Exception as e:
             print(f"❌ Error creating clip {clip_number}: {e}")

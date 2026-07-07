@@ -10,6 +10,7 @@ An intelligent video editing assistant that analyzes your content and automatica
 - 🧠 **Finds engaging moments** automatically using advanced algorithms  
 - ✂️ **Creates optimized clips** in vertical 9:16 format with captions
 - 🎯 **Tailors to your style** - funny, educational, viral, professional
+- 📈 **Packages clips for growth** with publish titles, captions, hashtags, CTAs, thumbnail prompts, and posting windows
 - 💬 **Conversational interface** - just tell it what you want!
 - **Conversational Interface**: Natural language interaction for preferences and customization
 - **Cost-Effective**: Uses Google Gemini API for affordable AI processing
@@ -40,6 +41,9 @@ Agent: "Perfect! I'll transcribe your podcast, find the most engaging moments, a
 
 User: "Make 3 clips, 45 seconds each, focus on the funny parts."
 Agent: "Got it! Hunting for the funniest moments and creating 45-second clips. Processing now..."
+
+User: "Make 5 YouTube Shorts for subscribers about fitness."
+Agent: "I'll create Shorts and package each one with a publish title, caption, tags, thumbnail text, comment prompt, CTA, and recommended posting window."
 ```
 
 ## Configuration
@@ -62,5 +66,7 @@ All settings are customizable through the conversational interface.
 
 - MP4 files optimized for social media
 - Animated captions overlay
-- Suggested titles and hashtags
-- Preview thumbnails"# opuslabs" 
+- Publish-ready title variants, captions, hashtags, and SEO tags
+- Thumbnail text and thumbnail generation prompts
+- Posting windows, CTAs, and engagement questions
+- Preview thumbnails

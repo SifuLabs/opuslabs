@@ -13,6 +13,15 @@ import random
 from typing import Dict, Any, Optional, List, Tuple
 from pathlib import Path
 
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+try:
+    from src.content_strategy import ContentStrategyBuilder
+except Exception:
+    ContentStrategyBuilder = None
+
 class VideoEditingCopilot:
     """Production-ready Video Editing Copilot with graceful degradation"""
     
@@ -20,6 +29,7 @@ class VideoEditingCopilot:
         self.config = self._load_config(config_path)
         self.available_features = set(['demo_mode', 'conversation'])
         self.moviepy_available = False
+        self.content_strategy = ContentStrategyBuilder() if ContentStrategyBuilder else None
         
         # Core conversation templates
         self.style_keywords = {
@@ -27,7 +37,7 @@ class VideoEditingCopilot:
             'educational': ['educational', 'learn', 'teach', 'explain', 'tutorial'],
             'energetic': ['energetic', 'exciting', 'hype', 'pump', 'intense'],
             'emotional': ['emotional', 'touching', 'heartfelt', 'moving', 'deep'],
-            'viral': ['viral', 'trending', 'hook', 'attention', 'grabbing'],
+            'viral': ['viral', 'trending', 'hook', 'attention', 'grabbing', 'secret', 'truth', 'controversial', 'surprising'],
             'professional': ['professional', 'business', 'corporate', 'clean']
         }
         
@@ -180,6 +190,40 @@ class VideoEditingCopilot:
             if any(keyword in input_lower for keyword in keywords):
                 preferences['style'] = style
                 break
+
+        # Detect target platform for the content launch pack
+        platform_keywords = {
+            'youtube_shorts': ['youtube shorts', 'shorts', 'youtube'],
+            'tiktok': ['tiktok', 'tik tok'],
+            'instagram': ['instagram', 'reels', 'ig'],
+            'linkedin': ['linkedin'],
+        }
+        for platform, keywords in platform_keywords.items():
+            if any(keyword in input_lower for keyword in keywords):
+                preferences['platform'] = platform
+                break
+
+        # Detect growth goal
+        goal_keywords = {
+            'subscribers': ['subscriber', 'subscribers', 'subs', 'grow my channel'],
+            'views': ['views', 'reach', 'awareness', 'impressions'],
+            'engagement': ['comments', 'engagement', 'likes', 'shares'],
+            'sales': ['sales', 'leads', 'clients', 'customers', 'bookings'],
+        }
+        for goal, keywords in goal_keywords.items():
+            if any(keyword in input_lower for keyword in keywords):
+                preferences['goal'] = goal
+                break
+
+        # Simple niche extraction. Prefer "about X" over "for subscribers about X".
+        niche_match = (
+            re.search(r'\babout\s+([a-z0-9][a-z0-9\s\-]{2,40})', input_lower)
+            or re.search(r'\b(?:for|targeting)\s+([a-z0-9][a-z0-9\s\-]{2,40})', input_lower)
+        )
+        if niche_match:
+            niche = re.split(r'\b(?:with|from|into|that|and|,)\b', niche_match.group(1))[0].strip()
+            if niche:
+                preferences['niche'] = niche
         
         # Content type hints
         if any(word in input_lower for word in ['podcast', 'interview', 'talk']):
@@ -260,7 +304,13 @@ class VideoEditingCopilot:
             # Step 3: Create clips
             print(f"✂️ Creating {len(engaging_segments)} clips...")
             generator = ClipGenerator()
-            settings = {'add_captions': True, 'style': style}
+            settings = {
+                'add_captions': True,
+                'style': style,
+                'platform': preferences.get('platform', 'general'),
+                'goal': preferences.get('goal', 'engagement'),
+                'niche': preferences.get('niche'),
+            }
             clips_info = generator.create_clips(video_path, engaging_segments, settings)
 
             return self._format_success_response(clips_info, preferences)
@@ -518,7 +568,9 @@ class VideoEditingCopilot:
             response += f"   • Duration: {clip['duration']} seconds\n"
             response += f"   • Hook: \"{clip['hook']}\"\n"
             response += f"   • Engagement Score: {clip['engagement_score']}/10\n"
-            response += f"   • File: {clip['output_path']}\n\n"
+            response += f"   • File: {clip['output_path']}\n"
+            response += self._format_launch_pack(clip)
+            response += "\n"
         
         # Add pro tips and setup info
         response += "💡 **Pro Tips:**\n"
@@ -576,9 +628,28 @@ class VideoEditingCopilot:
                 'output_path': f"output/clip_{i+1:02d}_{style}.mp4",
                 'engagement_score': round(random.uniform(7.0, 9.5), 1)
             }
+            if self.content_strategy:
+                clip['content_package'] = self.content_strategy.build_for_clip(clip, settings)
             clips.append(clip)
         
         return clips
+
+    def _format_launch_pack(self, clip: Dict[str, Any]) -> str:
+        """Format compact publish guidance for a clip."""
+        package = clip.get('content_package')
+        if not package:
+            return ""
+
+        lines = [
+            f"   • Publish title: {package['primary_title']}",
+            f"   • Caption: {package['short_caption']}",
+            f"   • Hashtags: {' '.join(package['hashtags'][:6])}",
+            f"   • Thumbnail text: {package['thumbnail_text']}",
+            f"   • Best window: {package['posting_window']}",
+            f"   • Comment prompt: {package['engagement_question']}",
+            f"   • CTA: {package['call_to_action']}",
+        ]
+        return "\n".join(lines) + "\n"
     
     def _format_success_response(self, clips: List[Dict[str, Any]], preferences: Dict[str, Any]) -> str:
         """Format response for successful video processing"""
@@ -599,6 +670,7 @@ class VideoEditingCopilot:
                 response += f"   • File: {clip['output_path']}  ({size_kb}KB)\n"
                 if clip.get('hashtags'):
                     response += f"   • Tags: {' '.join(clip['hashtags'][:5])}\n"
+                response += self._format_launch_pack(clip)
                 response += "\n"
         
         if failed_clips:

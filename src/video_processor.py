@@ -6,11 +6,17 @@ Handles video input, transcription, and preprocessing for the clipping agent.
 
 import os
 import tempfile
-import yt_dlp
 from typing import Dict, List, Optional, Tuple
 import subprocess
 import json
 from pathlib import Path
+
+try:
+    import yt_dlp
+    YT_DLP_AVAILABLE = True
+except ImportError:
+    yt_dlp = None
+    YT_DLP_AVAILABLE = False
 
 # Optional imports with error handling
 try:
@@ -66,6 +72,10 @@ class VideoProcessor:
         Returns:
             Path to downloaded video file or None if failed
         """
+        if not YT_DLP_AVAILABLE:
+            print("❌ yt-dlp not installed. Install with: pip install yt-dlp")
+            return None
+
         output_path = os.path.join(self.temp_dir, "downloaded_video.%(ext)s")
 
         base_opts = {
