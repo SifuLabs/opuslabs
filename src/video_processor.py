@@ -326,9 +326,10 @@ class VideoProcessor:
     def _transcribe_with_gemini_api(self, video_path: str) -> Optional[Dict[str, any]]:
         """Transcribe using Gemini API for enhanced analysis"""
         try:
-            import google.generativeai as genai
+            from google import genai
+            from google.genai import types as genai_types
         except ImportError:
-            print("❌ google-generativeai not installed. Please install with: pip install google-generativeai")
+            print("❌ google-genai not installed. Please install with: pip install google-genai")
             return self._create_simple_transcript(video_path)
         
         try:
@@ -345,11 +346,11 @@ class VideoProcessor:
                 print("❌ No API key found. Set GEMINI_API_KEY environment variable.")
                 return self._create_simple_transcript(video_path)
             
-            genai.configure(api_key=api_key)
-            model = genai.GenerativeModel('gemini-1.5-flash')
+            client = genai.Client(api_key=api_key)
+            model = os.getenv('GEMINI_MODEL', 'gemini-2.5-flash')
             
             # Upload audio file
-            audio_file = genai.upload_file(audio_path)
+            audio_file = client.files.upload(file=audio_path)
             
             # Create prompt for transcription with timestamps
             prompt = """
@@ -363,21 +364,55 @@ class VideoProcessor:
             Focus on accuracy and natural speech flow for video clipping purposes.
             """
             
-            response = model.generate_content([prompt, audio_file])
+            transcript_schema = {
+                'type': 'object',
+                'properties': {
+                    'language': {'type': 'string'},
+                    'segments': {
+                        'type': 'array',
+                        'items': {
+                            'type': 'object',
+                            'properties': {
+                                'start_time': {'type': 'number'},
+                                'end_time': {'type': 'number'},
+                                'text': {'type': 'string'},
+                                'speaker': {'type': 'string'},
+                            },
+                            'required': ['start_time', 'end_time', 'text'],
+                        },
+                    },
+                },
+                'required': ['segments'],
+            }
+            try:
+                response = client.models.generate_content(
+                    model=model,
+                    contents=[prompt, audio_file],
+                    config=genai_types.GenerateContentConfig(
+                        response_mime_type='application/json',
+                        response_schema=transcript_schema,
+                        temperature=0.0,
+                    ),
+                )
+            finally:
+                try:
+                    client.files.delete(name=audio_file.name)
+                except Exception:
+                    pass
             
             # Parse Gemini response (it might not be perfect JSON, so we'll handle it)
             try:
-                # Try to extract JSON from response
+                parsed = getattr(response, 'parsed', None)
                 import json
                 import re
-                
-                # Look for JSON in the response
-                json_match = re.search(r'\{.*\}', response.text, re.DOTALL)
-                if json_match:
-                    gemini_data = json.loads(json_match.group())
+
+                if isinstance(parsed, dict):
+                    gemini_data = parsed
                 else:
-                    # Fallback: parse the text response manually
-                    return self._parse_gemini_text_response(response.text, audio_path)
+                    json_match = re.search(r'\{.*\}', response.text, re.DOTALL)
+                    if not json_match:
+                        return self._parse_gemini_text_response(response.text, audio_path)
+                    gemini_data = json.loads(json_match.group())
                 
                 # Format for our system
                 if 'segments' in gemini_data:

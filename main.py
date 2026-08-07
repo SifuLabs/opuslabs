@@ -38,6 +38,7 @@ class VideoEditingCopilot:
         self.config = self._load_config(config_path)
         self.available_features = set(['demo_mode', 'conversation'])
         self.moviepy_available = False
+        self.ffmpeg_available = False
         self.content_strategy = ContentStrategyBuilder() if ContentStrategyBuilder else None
         
         # Core conversation templates
@@ -86,13 +87,14 @@ class VideoEditingCopilot:
         # Check for Gemini API
         if self.config.get('gemini_api_key'):
             try:
-                import google.generativeai as genai
-                genai.configure(api_key=self.config['gemini_api_key'])
-                self.gemini_model = genai.GenerativeModel('gemini-1.5-flash')
+                from google import genai
+                self.gemini_client = genai.Client(api_key=self.config['gemini_api_key'])
+                self.gemini_model = os.getenv('GEMINI_MODEL', 'gemini-2.5-flash')
                 self.available_features.add('ai_analysis')
+                self.available_features.add('transcription')
                 print("✅ Gemini AI integration ready")
             except ImportError:
-                print("⚠️  Gemini AI unavailable - install google-generativeai")
+                print("⚠️  Gemini AI unavailable - install google-genai")
             except Exception as e:
                 print(f"⚠️  Gemini setup issue: {e}")
         else:
@@ -103,6 +105,7 @@ class VideoEditingCopilot:
         
         # FFmpeg check
         if self._check_ffmpeg():
+            self.ffmpeg_available = True
             video_tools.append('ffmpeg')
             self.available_features.add('video_processing')
         
@@ -110,7 +113,6 @@ class VideoEditingCopilot:
         try:
             from moviepy import VideoFileClip
             video_tools.append('moviepy')
-            self.available_features.add('video_processing')
             self.moviepy_available = True
         except ImportError:
             self.moviepy_available = False
@@ -129,8 +131,7 @@ class VideoEditingCopilot:
             print(f"✅ Video tools available: {', '.join(video_tools)}")
         
         # Check if we have everything for full processing
-        if ('ai_analysis' in self.available_features and 
-            'video_processing' in self.available_features):
+        if self.ffmpeg_available and 'transcription' in self.available_features:
             self.available_features.add('full_processing')
     
     def _check_ffmpeg(self) -> bool:
@@ -211,6 +212,36 @@ class VideoEditingCopilot:
             if any(keyword in input_lower for keyword in keywords):
                 preferences['platform'] = platform
                 break
+
+        if any(phrase in input_lower for phrase in ['no captions', 'without captions', 'disable captions']):
+            preferences['add_captions'] = False
+        elif any(phrase in input_lower for phrase in ['with captions', 'add captions', 'burn captions']):
+            preferences['add_captions'] = True
+
+        reframe_keywords = {
+            'smart': ['smart crop', 'track face', 'face tracking', 'follow speaker'],
+            'blur': ['blur background', 'blurred background', 'blur mode'],
+            'crop': ['center crop', 'crop mode', 'fill frame'],
+            'fit': ['fit mode', 'black bars', 'show full frame'],
+        }
+        for reframe_mode, keywords in reframe_keywords.items():
+            if any(keyword in input_lower for keyword in keywords):
+                preferences['reframe_mode'] = reframe_mode
+                break
+
+        caption_theme_keywords = {
+            'bold': ['bold captions', 'viral captions', 'karaoke captions'],
+            'clean': ['clean captions', 'professional captions'],
+            'minimal': ['minimal captions', 'subtle captions'],
+        }
+        for caption_theme, keywords in caption_theme_keywords.items():
+            if any(keyword in input_lower for keyword in keywords):
+                preferences['caption_theme'] = caption_theme
+                break
+
+        brand_match = re.search(r'\b(?:brand label|watermark)\s+["\']?([a-z0-9][a-z0-9 ._-]{1,28})', input_lower)
+        if brand_match:
+            preferences['brand_label'] = brand_match.group(1).strip(' ._-"\'')
 
         # Detect growth goal
         goal_keywords = {
@@ -386,11 +417,18 @@ class VideoEditingCopilot:
             print(f"✂️ Creating {len(engaging_segments)} clips...")
             generator = ClipGenerator()
             settings = {
-                'add_captions': True,
+                'add_captions': preferences.get('add_captions', True),
+                'reframe_mode': preferences.get('reframe_mode', 'blur'),
+                'caption_theme': preferences.get('caption_theme', 'bold'),
+                'brand_label': preferences.get('brand_label'),
                 'style': style,
                 'platform': preferences.get('platform', 'general'),
                 'goal': preferences.get('goal', 'engagement'),
                 'niche': preferences.get('niche'),
+                'create_thumbnails': True,
+                'optimize_for_platform': True,
+                'export_subtitles': True,
+                'export_manifest': True,
             }
             clips_info = generator.create_clips(video_path, engaging_segments, settings)
 
@@ -466,7 +504,10 @@ class VideoEditingCopilot:
             Return your analysis as structured recommendations focusing on the most viral-worthy segments.
             """
             
-            response = self.gemini_model.generate_content(prompt)
+            response = self.gemini_client.models.generate_content(
+                model=self.gemini_model,
+                contents=prompt,
+            )
             ai_text = response.text
             
             # Parse AI insights and extract practical suggestions
@@ -933,7 +974,7 @@ class VideoEditingCopilot:
             response += "🔧 **To enable full video processing:**\n"
             response += "1. Set GEMINI_API_KEY environment variable\n"
             response += "2. Install FFmpeg: https://ffmpeg.org/download.html\n"
-            response += "3. Install dependencies: pip install google-generativeai whisper moviepy\n"
+            response += "3. Install dependencies: pip install google-genai openai-whisper moviepy\n"
             response += "4. Run: python main_production.py\n"
         
         return response

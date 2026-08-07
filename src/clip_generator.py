@@ -5,12 +5,18 @@ Handles video cutting, reformatting, and caption overlay for social media clips.
 """
 
 import os
+import sys
 import subprocess
 import json
+import csv
 from typing import Dict, List, Optional, Tuple
 from pathlib import Path
 import tempfile
 import numpy as np
+
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
 
 # Optional imports with error handling
 try:
@@ -106,6 +112,18 @@ class ClipGenerator:
                     print(f"❌ Failed to create clip {i+1}")
             
             print(f"✅ Successfully created {len(clips_info)} clips!")
+            if clips_info and settings.get('create_thumbnails', True):
+                self.create_preview_thumbnails(clips_info)
+
+            if clips_info and settings.get('optimize_for_platform', True):
+                clips_info = self.optimize_clips_for_platform(
+                    clips_info,
+                    settings.get('platform', 'general')
+                )
+
+            if clips_info and settings.get('export_manifest', True):
+                self.export_clip_manifest(clips_info, settings)
+
             return clips_info
             
         except Exception as e:
@@ -150,6 +168,10 @@ class ClipGenerator:
                 'start_time': segment.start_time,
                 'end_time': segment.end_time
             }
+            if settings.get('export_subtitles', True):
+                subtitle_path = self._write_subtitles(segment, output_path)
+                if subtitle_path:
+                    clip_info['subtitle_path'] = subtitle_path
             clip_info['content_package'] = self.content_strategy.build_for_clip(
                 clip_info,
                 settings
@@ -203,10 +225,14 @@ class ClipGenerator:
                 clip = video.subclipped(segment.start_time, segment.end_time)
                 
                 # Resize to vertical format
-                processed_clip = self._resize_to_vertical(clip)
+                processed_clip = self._resize_to_vertical(
+                    clip,
+                    settings.get('reframe_mode', 'blur')
+                )
                 
                 # Add captions if text is available
-                if hasattr(segment, 'text') and segment.text:
+                if (settings.get('add_captions', True)
+                        and hasattr(segment, 'text') and segment.text):
                     processed_clip = self._add_captions_moviepy(processed_clip, segment.text)
                 
                 # Write the final clip
@@ -250,25 +276,63 @@ class ClipGenerator:
                 '-t', str(duration),
             ]
 
-            # ----------------------------------------------------------------
-            # Base video filters: scale to 9:16, blur-pad the background
-            # ----------------------------------------------------------------
-            vf_parts = [
-                # Scale the content to fit inside 9:16, keeping aspect ratio
-                f"scale={self.target_width}:{self.target_height}:force_original_aspect_ratio=decrease",
-                # Pad the remaining space with a blurred copy of the video
-                # ffmpeg's 'boxing' technique: overlay content on blurred background
-                f"pad={self.target_width}:{self.target_height}:(ow-iw)/2:(oh-ih)/2:color=black",
-            ]
+            reframe_mode = str(settings.get('reframe_mode', 'blur')).lower()
+            if reframe_mode not in {'blur', 'crop', 'fit', 'smart'}:
+                reframe_mode = 'blur'
 
-            # ----------------------------------------------------------------
-            # Caption overlay
-            # ----------------------------------------------------------------
-            caption_filters = self._build_caption_filters(segment, duration)
-            vf_parts.extend(caption_filters)
+            caption_filters = (
+                self._build_caption_filters(segment, duration, settings)
+                if settings.get('add_captions', True)
+                else []
+            )
+            brand_filter = self._build_brand_filter(settings)
+            if brand_filter:
+                caption_filters.append(brand_filter)
+
+            if reframe_mode == 'blur':
+                # Build a full-frame blurred copy, then overlay a sharp fitted
+                # copy so landscape footage retains all meaningful content.
+                filter_complex = (
+                    f"[0:v]split=2[bg][fg];"
+                    f"[bg]scale={self.target_width}:{self.target_height}:"
+                    f"force_original_aspect_ratio=increase,"
+                    f"crop={self.target_width}:{self.target_height},"
+                    f"gblur=sigma=30[bg2];"
+                    f"[fg]scale={self.target_width}:{self.target_height}:"
+                    f"force_original_aspect_ratio=decrease[fg2];"
+                    f"[bg2][fg2]overlay=(W-w)/2:(H-h)/2"
+                )
+                if caption_filters:
+                    filter_complex += ',' + ','.join(caption_filters)
+                filter_complex += '[vout]'
+                cmd.extend([
+                    '-filter_complex', filter_complex,
+                    '-map', '[vout]',
+                    '-map', '0:a?',
+                ])
+            else:
+                if reframe_mode in {'crop', 'smart'}:
+                    focus_x, focus_y = (0.5, 0.5)
+                    if reframe_mode == 'smart':
+                        focus_x, focus_y = self._detect_subject_center(video_path, segment)
+                    vf_parts = [
+                        f"scale={self.target_width}:{self.target_height}:"
+                        f"force_original_aspect_ratio=increase",
+                        f"crop={self.target_width}:{self.target_height}:"
+                        f"x='max(0,min(iw-ow,iw*{focus_x:.4f}-ow/2))':"
+                        f"y='max(0,min(ih-oh,ih*{focus_y:.4f}-oh/2))'",
+                    ]
+                else:
+                    vf_parts = [
+                        f"scale={self.target_width}:{self.target_height}:"
+                        f"force_original_aspect_ratio=decrease",
+                        f"pad={self.target_width}:{self.target_height}:"
+                        f"(ow-iw)/2:(oh-ih)/2:color=black",
+                    ]
+                vf_parts.extend(caption_filters)
+                cmd.extend(['-vf', ','.join(vf_parts)])
 
             cmd.extend([
-                '-vf', ','.join(vf_parts),
                 '-r', str(self.target_fps),
                 '-c:v', 'libx264',
                 '-preset', 'fast',
@@ -315,6 +379,7 @@ class ClipGenerator:
         self,
         segment: EngagingSegment,
         clip_duration: float,
+        settings: Optional[Dict[str, any]] = None,
     ) -> List[str]:
         """
         Return a list of drawtext filter strings for the caption overlay.
@@ -333,15 +398,23 @@ class ClipGenerator:
           - Horizontally centred, positioned at 78 % of the frame height
           - Wrapped at ~20 chars per line by drawtext's built-in :line_spacing
         """
-        WORDS_PER_GROUP = 3   # words shown at once (matching viral TikTok/Reels style)
-        FONT_SIZE       = 72
-        STROKE_W        = 4
-        Y_POS           = 'h*0.78'
+        settings = settings or {}
+        themes = {
+            'bold': {'words': 3, 'size': 72, 'stroke': 4, 'box': '0x00000099', 'border': 12},
+            'clean': {'words': 5, 'size': 58, 'stroke': 3, 'box': '0x11111188', 'border': 10},
+            'minimal': {'words': 7, 'size': 48, 'stroke': 2, 'box': '0x00000055', 'border': 8},
+        }
+        theme = themes.get(str(settings.get('caption_theme', 'bold')), themes['bold'])
+        WORDS_PER_GROUP = int(theme['words'])
+        FONT_SIZE       = int(settings.get('caption_font_size', theme['size']))
+        STROKE_W        = int(theme['stroke'])
+        positions = {'top': 'h*0.16', 'middle': 'h*0.48', 'bottom': 'h*0.78'}
+        Y_POS           = positions.get(str(settings.get('caption_position', 'bottom')), 'h*0.78')
         X_POS           = '(w-text_w)/2'
-        TEXT_COLOR      = 'white'
+        TEXT_COLOR      = self._safe_ffmpeg_color(settings.get('caption_color', 'white'), 'white')
         STROKE_COLOR    = 'black'
-        BOX_COLOR       = '0x00000099'  # semi-transparent black
-        BOX_BORDER      = 12            # px padding around text box
+        BOX_COLOR       = str(theme['box'])
+        BOX_BORDER      = int(theme['border'])
 
         def _dt(text: str, t_start: float, t_end: float) -> str:
             """Single drawtext filter string with timed enable expression."""
@@ -400,7 +473,7 @@ class ClipGenerator:
 
         return filters
     
-    def _resize_to_vertical(self, clip):
+    def _resize_to_vertical(self, clip, mode: str = 'crop'):
         """Resize video to vertical 9:16 format"""
         if not MOVIEPY_AVAILABLE:
             return clip  # Skip if MoviePy not available
@@ -412,6 +485,18 @@ class ClipGenerator:
         target_ratio = self.target_width / self.target_height
         current_ratio = w / h
         
+        if mode in {'fit', 'blur'}:
+            if current_ratio > target_ratio:
+                fitted = clip.resized(width=self.target_width)
+            else:
+                fitted = clip.resized(height=self.target_height)
+            # MoviePy is only a fallback. Its fit canvas remains black; the
+            # primary FFmpeg path provides the true blurred background.
+            return CompositeVideoClip(
+                [fitted.with_position(('center', 'center'))],
+                size=(self.target_width, self.target_height)
+            ).with_duration(clip.duration)
+
         if current_ratio > target_ratio:
             # Video is wider - crop sides (MoviePy 2.x uses cropped)
             new_width = int(h * target_ratio)
@@ -529,7 +614,191 @@ class ClipGenerator:
             print(f"Error getting video info: {e}")
         
         return {}
+
+    @staticmethod
+    def _format_srt_timestamp(seconds: float) -> str:
+        """Format seconds as an SRT timestamp."""
+        milliseconds = max(0, int(round(seconds * 1000)))
+        hours, remainder = divmod(milliseconds, 3_600_000)
+        minutes, remainder = divmod(remainder, 60_000)
+        secs, millis = divmod(remainder, 1000)
+        return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
+
+    def _write_subtitles(
+        self,
+        segment: EngagingSegment,
+        output_path: str,
+        words_per_cue: int = 6,
+    ) -> Optional[str]:
+        """Write editable SRT subtitles next to a generated clip."""
+        subtitle_path = str(Path(output_path).with_suffix('.srt'))
+        clip_duration = max(0.0, segment.end_time - segment.start_time)
+        cues: List[Tuple[float, float, str]] = []
+        words = segment.word_segments or []
+
+        for index in range(0, len(words), words_per_cue):
+            group = words[index:index + words_per_cue]
+            if not group:
+                continue
+            start = max(0.0, float(group[0].get('start', segment.start_time)) - segment.start_time)
+            end = min(
+                clip_duration,
+                float(group[-1].get('end', segment.end_time)) - segment.start_time,
+            )
+            if end <= start:
+                end = min(clip_duration, start + 1.0)
+            text = ' '.join(str(word.get('word', '')).strip() for word in group).strip()
+            if text:
+                cues.append((start, end, text))
+
+        if not cues and (segment.text or '').strip():
+            cues.append((0.0, clip_duration, segment.text.strip()))
+
+        if not cues:
+            return None
+
+        lines: List[str] = []
+        for number, (start, end, text) in enumerate(cues, start=1):
+            lines.extend([
+                str(number),
+                f"{self._format_srt_timestamp(start)} --> {self._format_srt_timestamp(end)}",
+                text.replace('\n', ' '),
+                '',
+            ])
+        Path(subtitle_path).write_text('\n'.join(lines), encoding='utf-8')
+        return subtitle_path
     
+    def export_clip_manifest(
+        self,
+        clips_info: List[Dict[str, any]],
+        settings: Dict[str, any],
+    ) -> Dict[str, str]:
+        """Export complete clip metadata as JSON and a compact CSV."""
+        manifest_path = Path(self.output_dir) / 'clip_manifest.json'
+        csv_path = Path(self.output_dir) / 'clip_manifest.csv'
+        payload = {
+            'schema_version': 1,
+            'platform': settings.get('platform', 'general'),
+            'reframe_mode': settings.get('reframe_mode', 'blur'),
+            'captions_burned_in': bool(settings.get('add_captions', True)),
+            'clips': clips_info,
+        }
+        manifest_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding='utf-8',
+        )
+
+    @staticmethod
+    def _safe_ffmpeg_color(value: any, fallback: str) -> str:
+        """Allow named or hexadecimal colors without filter injection."""
+        candidate = str(value or '').strip()
+        allowed = set('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789#x')
+        if candidate and len(candidate) <= 24 and all(char in allowed for char in candidate):
+            return candidate
+        return fallback
+
+    def _build_brand_filter(self, settings: Dict[str, any]) -> Optional[str]:
+        """Create a restrained, safe-zone brand label when requested."""
+        raw_label = str(settings.get('brand_label') or '').strip()
+        if not raw_label:
+            return None
+        label = self._esc(raw_label[:32].upper())
+        return (
+            f"drawtext=text='{label}'"
+            f":fontsize=30:fontcolor=white:borderw=2:bordercolor=black"
+            f":box=1:boxcolor=0x00000088:boxborderw=9"
+            f":x=40:y=54:fix_bounds=true"
+        )
+
+    def _detect_subject_center(
+        self,
+        video_path: str,
+        segment: EngagingSegment,
+        sample_count: int = 12,
+    ) -> Tuple[float, float]:
+        """Estimate a stable crop focus from faces sampled across the clip."""
+        if not CV2_AVAILABLE:
+            return 0.5, 0.5
+
+        capture = cv2.VideoCapture(video_path)
+        centers: List[Tuple[float, float]] = []
+        try:
+            cascade_path = os.path.join(
+                cv2.data.haarcascades,
+                'haarcascade_frontalface_default.xml',
+            )
+            detector = cv2.CascadeClassifier(cascade_path)
+            if detector.empty():
+                return 0.5, 0.5
+
+            sample_times = np.linspace(
+                segment.start_time,
+                segment.end_time,
+                max(2, sample_count),
+            )
+            for timestamp in sample_times:
+                capture.set(cv2.CAP_PROP_POS_MSEC, float(timestamp) * 1000)
+                success, frame = capture.read()
+                if not success or frame is None:
+                    continue
+                height, width = frame.shape[:2]
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                faces = detector.detectMultiScale(
+                    gray,
+                    scaleFactor=1.12,
+                    minNeighbors=5,
+                    minSize=(max(30, width // 16), max(30, height // 16)),
+                )
+                if len(faces):
+                    x, y, face_width, face_height = max(
+                        faces,
+                        key=lambda face: int(face[2]) * int(face[3]),
+                    )
+                    centers.append((
+                        (x + face_width / 2) / width,
+                        min(0.85, (y + face_height * 0.75) / height),
+                    ))
+        except Exception as error:
+            print(f"Smart reframing fallback: {error}")
+        finally:
+            capture.release()
+
+        if not centers:
+            return 0.5, 0.5
+        return (
+            float(np.median([center[0] for center in centers])),
+            float(np.median([center[1] for center in centers])),
+        )
+
+        fieldnames = [
+            'clip_number', 'title', 'start_time', 'end_time', 'duration',
+            'engagement_score', 'output_path', 'optimized_path',
+            'thumbnail_path', 'subtitle_path', 'short_caption', 'hashtags',
+        ]
+        with csv_path.open('w', newline='', encoding='utf-8-sig') as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            for clip in clips_info:
+                package = clip.get('content_package', {})
+                writer.writerow({
+                    'clip_number': clip.get('clip_number'),
+                    'title': clip.get('title'),
+                    'start_time': clip.get('start_time'),
+                    'end_time': clip.get('end_time'),
+                    'duration': clip.get('duration'),
+                    'engagement_score': clip.get('engagement_score'),
+                    'output_path': clip.get('output_path'),
+                    'optimized_path': clip.get('optimized_path', ''),
+                    'thumbnail_path': clip.get('thumbnail_path', ''),
+                    'subtitle_path': clip.get('subtitle_path', ''),
+                    'short_caption': package.get('short_caption', ''),
+                    'hashtags': ' '.join(package.get('hashtags', clip.get('hashtags', []))),
+                })
+
+        for clip in clips_info:
+            clip['manifest_path'] = str(manifest_path)
+        return {'json': str(manifest_path), 'csv': str(csv_path)}
+
     def create_preview_thumbnails(self, clips_info: List[Dict[str, any]]) -> List[str]:
         """Create preview thumbnails for clips"""
         thumbnail_paths = []
@@ -540,9 +809,11 @@ class ClipGenerator:
                 thumbnail_path = video_path.replace('.mp4', '_thumb.jpg')
                 
                 # Extract frame at middle of clip using ffmpeg
+                info = self._get_video_info_ffprobe(video_path)
+                duration = float(info.get('format', {}).get('duration', clip_info.get('duration', 0)))
+                midpoint = max(0.0, duration / 2)
                 cmd = [
-                    'ffmpeg', '-i', video_path,
-                    '-ss', '50%',  # Middle of video
+                    'ffmpeg', '-ss', f'{midpoint:.3f}', '-i', video_path,
                     '-vframes', '1',
                     '-q:v', '2',  # High quality
                     '-y',
@@ -575,7 +846,7 @@ class ClipGenerator:
         platform_settings = {
             'tiktok': {'max_size_mb': 287, 'max_duration': 60},
             'instagram': {'max_size_mb': 100, 'max_duration': 60},
-            'youtube_shorts': {'max_size_mb': 256, 'max_duration': 60},
+            'youtube_shorts': {'max_size_mb': 256, 'max_duration': 180},
             'general': {'max_size_mb': 100, 'max_duration': 60}
         }
         
@@ -592,8 +863,8 @@ class ClipGenerator:
                 if file_size_mb > settings['max_size_mb']:
                     # Compress the video
                     compressed_path = video_path.replace('.mp4', f'_{platform}_optimized.mp4')
-                    self._compress_video(video_path, compressed_path, settings['max_size_mb'])
-                    clip_info['optimized_path'] = compressed_path
+                    if self._compress_video(video_path, compressed_path, settings['max_size_mb']):
+                        clip_info['optimized_path'] = compressed_path
                 
                 optimized_clips.append(clip_info)
                 
@@ -603,7 +874,7 @@ class ClipGenerator:
         
         return optimized_clips
     
-    def _compress_video(self, input_path: str, output_path: str, target_size_mb: float):
+    def _compress_video(self, input_path: str, output_path: str, target_size_mb: float) -> bool:
         """Compress video to target file size"""
         try:
             # Get video duration for bitrate calculation
@@ -627,10 +898,12 @@ class ClipGenerator:
                 output_path
             ]
             
-            subprocess.run(cmd, capture_output=True)
+            result = subprocess.run(cmd, capture_output=True)
+            return result.returncode == 0 and os.path.exists(output_path)
             
         except Exception as e:
             print(f"Video compression failed: {e}")
+            return False
     
     def __del__(self):
         """Cleanup on destruction"""

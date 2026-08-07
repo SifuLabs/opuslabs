@@ -106,14 +106,21 @@ def validate_dependencies() -> Dict[str, bool]:
         dependencies['ffmpeg'] = False
     
     # Check Python packages
-    required_packages = [
-        'whisper', 'moviepy', 'opencv-python', 'nltk', 
-        'textstat', 'google-generativeai', 'yt-dlp', 'pillow'
-    ]
+    required_packages = {
+        'whisper': 'whisper',
+        'moviepy': 'moviepy',
+        'opencv-python': 'cv2',
+        'nltk': 'nltk',
+        'textstat': 'textstat',
+        'google-genai': 'google.genai',
+        'yt-dlp': 'yt_dlp',
+        'pillow': 'PIL',
+    }
     
-    for package in required_packages:
+    import importlib
+    for package, import_name in required_packages.items():
         try:
-            __import__(package.replace('-', '_'))
+            importlib.import_module(import_name)
             dependencies[package] = True
         except ImportError:
             dependencies[package] = False

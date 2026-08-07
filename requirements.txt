@@ -1,5 +1,5 @@
 # Core requirements
-google-generativeai>=0.3.0
+google-genai>=1.0.0
 moviepy>=1.0.3
 opencv-python>=4.8.0
 numpy>=1.24.0
@@ -12,6 +12,6 @@ nltk>=3.8
 textstat>=0.7.0
 
 # Optional requirements (install separately if needed)
-# whisper>=1.1.10          # For local transcription
+# openai-whisper>=20240930  # For local transcription
 # assemblyai>=0.17.0       # For AssemblyAI transcription
 # librosa>=0.10.0          # For advanced audio processing

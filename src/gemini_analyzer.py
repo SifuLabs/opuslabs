@@ -11,17 +11,20 @@ import re
 import time
 import hashlib
 import json
+import math
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass
 
 # Optional imports with error handling
 try:
-    import google.generativeai as genai
+    from google import genai
+    from google.genai import types as genai_types
     GEMINI_AVAILABLE = True
 except ImportError:
-    print("⚠️ google-generativeai not available. Install with: pip install google-generativeai")
+    print("⚠️ google-genai not available. Install with: pip install google-genai")
     genai = None
+    genai_types = None
     GEMINI_AVAILABLE = False
 
 try:
@@ -42,9 +45,39 @@ except ImportError:
 # keeping costs low. Raise to 8000 on a paid plan.
 MAX_TRANSCRIPT_CHARS = int(os.getenv('GEMINI_MAX_TRANSCRIPT_CHARS', '4000'))
 
-# Gemini model. gemini-1.5-flash-8b is the free-tier-friendly default
-# (higher RPM, lower cost). Switch to gemini-1.5-flash for more capability.
-DEFAULT_MODEL = os.getenv('GEMINI_MODEL', 'gemini-1.5-flash-8b')
+# Keep the model configurable so deployments can upgrade independently.
+DEFAULT_MODEL = os.getenv('GEMINI_MODEL', 'gemini-2.5-flash')
+
+ANALYSIS_RESPONSE_SCHEMA = {
+    'type': 'object',
+    'properties': {
+        'engaging_moments': {
+            'type': 'array',
+            'items': {
+                'type': 'object',
+                'properties': {
+                    'title': {'type': 'string'},
+                    'hook': {'type': 'string'},
+                    'start_time': {'type': 'number'},
+                    'end_time': {'type': 'number'},
+                    'engagement_score': {'type': 'number'},
+                    'viral_potential': {'type': 'number'},
+                    'emotion': {'type': 'string'},
+                    'segment_type': {'type': 'string'},
+                    'keywords': {'type': 'array', 'items': {'type': 'string'}},
+                    'hashtags': {'type': 'array', 'items': {'type': 'string'}},
+                    'reason': {'type': 'string'},
+                },
+                'required': [
+                    'title', 'hook', 'start_time', 'end_time',
+                    'engagement_score', 'viral_potential', 'emotion',
+                    'segment_type', 'keywords', 'hashtags', 'reason',
+                ],
+            },
+        },
+    },
+    'required': ['engaging_moments'],
+}
 
 # Cache directory. Set GEMINI_CACHE_DIR=off to disable caching entirely.
 _cache_dir_env = os.getenv('GEMINI_CACHE_DIR', './.cache/gemini')
@@ -79,8 +112,7 @@ class GeminiTranscriptAnalyzer:
         # Support both GEMINI_API_KEY and GOOGLE_API_KEY (prefer GEMINI_API_KEY)
         api_key = os.getenv('GEMINI_API_KEY') or os.getenv('GOOGLE_API_KEY')
         if api_key and GEMINI_AVAILABLE:
-            genai.configure(api_key=api_key)
-            self.model = genai.GenerativeModel(DEFAULT_MODEL)
+            self.client = genai.Client(api_key=api_key)
             self.use_ai_analysis = True
             print(f"✅ Gemini model: {DEFAULT_MODEL}")
         else:
@@ -209,7 +241,18 @@ class GeminiTranscriptAnalyzer:
         delay = 30  # seconds before first retry
         for attempt in range(1, max_retries + 2):  # +1 for the initial attempt
             try:
-                response = self.model.generate_content(prompt)
+                response = self.client.models.generate_content(
+                    model=DEFAULT_MODEL,
+                    contents=prompt,
+                    config=genai_types.GenerateContentConfig(
+                        response_mime_type='application/json',
+                        response_schema=ANALYSIS_RESPONSE_SCHEMA,
+                        temperature=0.2,
+                    ),
+                )
+                parsed = getattr(response, 'parsed', None)
+                if isinstance(parsed, dict):
+                    return parsed
                 return self._parse_gemini_analysis(response.text)
             except Exception as e:
                 err = str(e)
@@ -223,7 +266,7 @@ class GeminiTranscriptAnalyzer:
                 print(f"❌ Gemini call failed: {e}")
                 if is_rate_limit:
                     print("   Tip: the result is cached after a successful run, so retries won't cost extra.")
-                    print(f"   Or set GEMINI_MODEL=gemini-2.0-flash-lite in your .env for higher free-tier limits.")
+                    print("   Try a lower-cost model through GEMINI_MODEL if your account supports one.")
                     print(f"   Current model: {DEFAULT_MODEL}")
                 return None
         return None
@@ -426,6 +469,7 @@ IMPORTANT:
         
         max_video_time = segments[-1]['end'] if segments else 0
         result_segments = []
+        selected_ranges = []
         
         for moment in engaging_moments:
             # Use direct timestamps from Gemini response
@@ -442,6 +486,10 @@ IMPORTANT:
             except (TypeError, ValueError):
                 print(f"⚠️ Skipping moment '{moment.get('title', '?')}' — invalid timestamps")
                 continue
+
+            if not math.isfinite(start_time) or not math.isfinite(end_time):
+                print(f"⚠️ Skipping moment '{moment.get('title', '?')}' — non-finite timestamps")
+                continue
             
             # Snap timestamps to nearest real segment boundary for accuracy
             start_time = self._snap_to_segment(segments, start_time, 'start')
@@ -449,7 +497,14 @@ IMPORTANT:
             
             # Clamp to video bounds
             start_time = max(0.0, min(start_time, max_video_time))
-            end_time = max(start_time + 5.0, min(end_time, max_video_time))
+            end_time = max(0.0, min(end_time, max_video_time))
+            if end_time <= start_time:
+                print(f"⚠️ Skipping moment '{moment.get('title', '?')}' — empty time range")
+                continue
+            if any(start_time < used_end and end_time > used_start
+                   for used_start, used_end in selected_ranges):
+                print(f"⚠️ Skipping moment '{moment.get('title', '?')}' — overlaps another clip")
+                continue
             
             segment_text = self._extract_text_for_timerange(segments, start_time, end_time)
             word_segs   = self._extract_words_for_timerange(segments, start_time, end_time)
@@ -470,6 +525,7 @@ IMPORTANT:
             )
             
             result_segments.append(engaging_segment)
+            selected_ranges.append((start_time, end_time))
         
         return result_segments
 
