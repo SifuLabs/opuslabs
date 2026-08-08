@@ -19,6 +19,7 @@ myenv/
 
 # Temporary files
 temp/
+.opuslabs/
 *.tmp
 *.temp
 

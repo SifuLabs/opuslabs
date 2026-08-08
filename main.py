@@ -5,11 +5,13 @@ This version gracefully handles all dependency issues and provides
 a complete working experience with progressive feature loading.
 """
 
+import argparse
 import os
 import sys
 import json
 import re
 import random
+from dataclasses import asdict
 from typing import Dict, Any, Optional, List, Tuple
 from pathlib import Path
 
@@ -36,6 +38,14 @@ except Exception:
     apply_transcript_corrections = None
     load_transcript_corrections = None
 
+try:
+    from src.job_manager import JobCancelled, JobManager, JobRecord, ProjectRecord
+except Exception:
+    JobCancelled = RuntimeError
+    JobManager = None
+    JobRecord = None
+    ProjectRecord = None
+
 # Load environment variables from .env file
 try:
     from dotenv import load_dotenv
@@ -55,6 +65,9 @@ class VideoEditingCopilot:
         self.ffmpeg_available = False
         self.content_strategy = ContentStrategyBuilder() if ContentStrategyBuilder else None
         self.brand_kits = BrandKitStore() if BrandKitStore else None
+        self.job_manager = JobManager() if JobManager else None
+        if self.job_manager:
+            self.available_features.add('projects_and_jobs')
         
         # Core conversation templates
         self.style_keywords = {
@@ -411,6 +424,76 @@ class VideoEditingCopilot:
             )
             resolved['brand_kit'] = save_name
         return resolved
+
+    def _require_job_manager(self) -> Any:
+        if not self.job_manager:
+            raise RuntimeError('Persistent project support is unavailable.')
+        return self.job_manager
+
+    def create_project(self, name: str, sources: Optional[List[str]] = None) -> Any:
+        """Create a durable multi-source project."""
+        return self._require_job_manager().create_project(name, sources or [])
+
+    def add_project_source(self, project_id: str, source_path: str) -> Any:
+        """Add another source video or URL to a project."""
+        return self._require_job_manager().add_source(project_id, source_path)
+
+    def queue_project(self, project_id: str, user_request: str) -> List[Any]:
+        """Create one isolated queued job for every source in a project."""
+        preferences = self._parse_user_preferences(user_request)
+        preferences = self._apply_brand_kit_preferences(preferences)
+        for path_key in ('brand_logo', 'transcript_corrections_file'):
+            configured_path = preferences.get(path_key)
+            if configured_path:
+                preferences[path_key] = str(Path(configured_path).expanduser().resolve())
+        return self._require_job_manager().enqueue_project(
+            project_id,
+            user_request,
+            preferences,
+        )
+
+    def run_next_job(self, project_id: Optional[str] = None) -> Optional[Any]:
+        """Claim and process one queued job, persisting its terminal state."""
+        manager = self._require_job_manager()
+        job = manager.claim_next_job(project_id)
+        if job is None:
+            return None
+        try:
+            response = self._process_real_video(
+                job.source_path,
+                job.preferences,
+                job.request_text,
+                job_manager=manager,
+                job_id=job.id,
+            )
+            manager.check_cancelled(job.id)
+            checkpoint = manager.read_checkpoint(job.id, 'clips') or []
+            result = {
+                'response': response,
+                'clips': checkpoint,
+                'output_directory': manager.workspace_directories(job.id)['output'],
+            }
+            return manager.complete_job(job.id, result)
+        except JobCancelled as error:
+            return manager.mark_cancelled(job.id, str(error))
+        except Exception as error:
+            return manager.fail_job(job.id, str(error))
+
+    def run_queued_jobs(
+        self,
+        project_id: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> List[Any]:
+        """Process queued jobs sequentially; multiple processes may call this safely."""
+        if limit is not None and limit < 1:
+            raise ValueError('Job run limit must be at least one.')
+        processed = []
+        while limit is None or len(processed) < limit:
+            job = self.run_next_job(project_id)
+            if job is None:
+                break
+            processed.append(job)
+        return processed
     
     def _request_video_input(self) -> Optional[str]:
         """Request video input from user"""
@@ -510,7 +593,7 @@ class VideoEditingCopilot:
             print(f"❌ Download failed: {e}")
             return None
     
-    def _process_real_video(self, video_path: str, preferences: Dict[str, Any], user_input: str) -> str:
+    def _process_real_video_direct(self, video_path: str, preferences: Dict[str, Any], user_input: str) -> str:
         """Process actual video file using the full src/ pipeline"""
         try:
             from src.video_processor import VideoProcessor
@@ -605,6 +688,166 @@ class VideoEditingCopilot:
             traceback.print_exc()
             return f"❌ Processing error: {e}"
     
+    def _process_real_video(
+        self,
+        video_path: str,
+        preferences: Dict[str, Any],
+        user_input: str,
+        job_manager: Optional[Any] = None,
+        job_id: Optional[str] = None,
+    ) -> str:
+        """Process directly, or use isolated directories and checkpoints for a job."""
+        if not job_manager or not job_id:
+            return self._process_real_video_direct(video_path, preferences, user_input)
+
+        from src.clip_generator import ClipGenerator
+        from src.gemini_analyzer import EngagingSegment, GeminiTranscriptAnalyzer
+        from src.video_processor import VideoProcessor
+
+        manager = job_manager
+        directories = manager.workspace_directories(job_id)
+
+        def report(progress: int, stage: str) -> None:
+            manager.update_progress(job_id, progress, stage)
+
+        def cancellation_requested() -> bool:
+            current_job = manager.get_job(job_id)
+            return bool(
+                not current_job
+                or current_job.cancel_requested
+                or current_job.state == 'cancelled'
+            )
+
+        report(2, 'Preparing source')
+        processor = VideoProcessor()
+        processor.temp_dir = directories['temp']
+        os.makedirs(processor.temp_dir, exist_ok=True)
+
+        working_video_path = video_path
+        if video_path.startswith(('http://', 'https://')):
+            source_checkpoint = manager.read_checkpoint(job_id, 'source')
+            cached_source = source_checkpoint.get('local_path') if source_checkpoint else None
+            if cached_source and os.path.exists(cached_source):
+                working_video_path = cached_source
+            else:
+                processor.temp_dir = directories['input']
+                working_video_path = processor.download_video(video_path)
+                if not working_video_path:
+                    raise RuntimeError('Source download failed.')
+                manager.write_checkpoint(
+                    job_id,
+                    'source',
+                    {'original': video_path, 'local_path': working_video_path},
+                )
+                processor.temp_dir = directories['temp']
+
+        report(8, 'Loading transcript')
+        transcript = manager.read_checkpoint(job_id, 'transcript_raw')
+        if transcript:
+            print('⚡ Reusing transcript checkpoint')
+        else:
+            print('🎤 Transcribing video...')
+            transcript = processor.transcribe_video(working_video_path)
+            if not transcript or not transcript.get('segments'):
+                raise RuntimeError(
+                    'Transcription failed — no segments found. Check FFmpeg and Whisper setup.'
+                )
+            manager.write_checkpoint(job_id, 'transcript_raw', transcript)
+        report(38, 'Transcript ready')
+
+        correction_pairs = dict(preferences.get('transcript_corrections', {}))
+        correction_path = preferences.get('transcript_corrections_file')
+        if correction_path:
+            if not load_transcript_corrections:
+                raise RuntimeError('Transcript correction helpers are unavailable.')
+            correction_pairs.update(load_transcript_corrections(correction_path))
+        if correction_pairs:
+            if not apply_transcript_corrections:
+                raise RuntimeError('Transcript correction helpers are unavailable.')
+            transcript, correction_count = apply_transcript_corrections(
+                transcript,
+                correction_pairs,
+            )
+            print(f'✏️ Applied {correction_count} transcript corrections')
+        manager.write_checkpoint(job_id, 'transcript', transcript)
+
+        clip_count = preferences.get('clip_count', self.config.get('default_clip_count', 5))
+        min_len = preferences.get('clip_length_min', 30)
+        max_len = preferences.get('clip_length_max', 60)
+        style = preferences.get('style', 'engaging')
+
+        report(42, 'Loading clip analysis')
+        segment_checkpoint = manager.read_checkpoint(job_id, 'segments')
+        if segment_checkpoint:
+            engaging_segments = [EngagingSegment(**segment) for segment in segment_checkpoint]
+            print('⚡ Reusing clip-analysis checkpoint')
+        else:
+            analyzer = GeminiTranscriptAnalyzer()
+            engaging_segments = analyzer.find_engaging_moments(
+                transcript,
+                target_clips=clip_count,
+                min_length=min_len,
+                max_length=max_len,
+                style=style,
+            )
+            if engaging_segments:
+                manager.write_checkpoint(
+                    job_id,
+                    'segments',
+                    [asdict(segment) for segment in engaging_segments],
+                )
+        if not engaging_segments:
+            raise RuntimeError(
+                'No engaging segments found. Try a different style or verify the source speech.'
+            )
+        report(62, 'Clip analysis ready')
+
+        generator = ClipGenerator()
+        generator.output_dir = directories['output']
+        generator.temp_dir = directories['temp']
+        os.makedirs(generator.output_dir, exist_ok=True)
+        os.makedirs(generator.temp_dir, exist_ok=True)
+
+        def clip_progress(completed: int, total: int) -> None:
+            progress = 64 + int((completed / max(1, total)) * 31)
+            report(progress, f'Rendered clip {completed} of {total}')
+
+        settings = {
+            'add_captions': preferences.get('add_captions', True),
+            'reframe_mode': preferences.get('reframe_mode', 'blur'),
+            'caption_theme': preferences.get('caption_theme', 'bold'),
+            'caption_position': preferences.get('caption_position', 'bottom'),
+            'caption_color': preferences.get('caption_color', 'white'),
+            'caption_font_size': preferences.get('caption_font_size'),
+            'brand_label': preferences.get('brand_label'),
+            'brand_logo': preferences.get('brand_logo'),
+            'brand_logo_position': preferences.get('brand_logo_position', 'top-right'),
+            'brand_logo_width': preferences.get('brand_logo_width'),
+            'brand_logo_opacity': preferences.get('brand_logo_opacity', 0.9),
+            'brand_kit': preferences.get('brand_kit'),
+            'subtitle_languages': preferences.get('subtitle_languages', []),
+            'style': style,
+            'platform': preferences.get('platform', 'general'),
+            'goal': preferences.get('goal', 'engagement'),
+            'niche': preferences.get('niche'),
+            'create_thumbnails': True,
+            'optimize_for_platform': True,
+            'export_subtitles': True,
+            'export_manifest': True,
+            '_cancel_check': cancellation_requested,
+            '_progress_callback': clip_progress,
+        }
+        clips_info = generator.create_clips(
+            working_video_path,
+            engaging_segments,
+            settings,
+        )
+        report(96, 'Finalizing output package')
+        if not clips_info:
+            raise RuntimeError('No clips were rendered successfully.')
+        manager.write_checkpoint(job_id, 'clips', clips_info)
+        return self._format_success_response(clips_info, preferences)
+
     def _get_video_duration(self, video_path: str) -> float:
         """Get video duration using MoviePy"""
         try:
@@ -1317,16 +1560,122 @@ class VideoEditingCopilot:
         
         print()
 
-def main():
-    """Main entry point"""
-    if len(sys.argv) > 1:
-        user_request = " ".join(sys.argv[1:])
-        copilot = VideoEditingCopilot()
-        response = copilot.process_video_request(user_request)
-        print(response)
+def _run_management_cli(copilot: VideoEditingCopilot, arguments: List[str]) -> int:
+    """Run persistent project and job management commands."""
+    parser = argparse.ArgumentParser(prog='python main.py')
+    command_parsers = parser.add_subparsers(dest='resource', required=True)
+
+    project_parser = command_parsers.add_parser('project', help='Manage durable projects')
+    project_commands = project_parser.add_subparsers(dest='action', required=True)
+    create_project = project_commands.add_parser('create', help='Create a project')
+    create_project.add_argument('name')
+    create_project.add_argument('sources', nargs='*')
+    project_commands.add_parser('list', help='List projects')
+    show_project = project_commands.add_parser('show', help='Show a project and its sources')
+    show_project.add_argument('project_id')
+    add_source = project_commands.add_parser('add-source', help='Add project sources')
+    add_source.add_argument('project_id')
+    add_source.add_argument('sources', nargs='+')
+
+    job_parser = command_parsers.add_parser('job', help='Manage queued processing jobs')
+    job_commands = job_parser.add_subparsers(dest='action', required=True)
+    enqueue_job = job_commands.add_parser('enqueue', help='Queue all sources in a project')
+    enqueue_job.add_argument('project_id')
+    enqueue_job.add_argument('request', nargs='+')
+    list_jobs = job_commands.add_parser('list', help='List jobs')
+    list_jobs.add_argument('--project', dest='project_id')
+    list_jobs.add_argument('--state', choices=sorted(['queued', 'running', 'completed', 'failed', 'cancelled']))
+    run_jobs = job_commands.add_parser('run', help='Process queued jobs')
+    run_jobs.add_argument('--project', dest='project_id')
+    run_jobs.add_argument('--limit', type=int)
+    cancel_job = job_commands.add_parser('cancel', help='Request job cancellation')
+    cancel_job.add_argument('job_id')
+    retry_job = job_commands.add_parser('retry', help='Retry a failed or cancelled job')
+    retry_job.add_argument('job_id')
+    recover_jobs = job_commands.add_parser('recover', help='Recover stale running jobs')
+    recover_jobs.add_argument('--stale-seconds', type=int)
+    recover_jobs.add_argument('--force', action='store_true')
+    job_events = job_commands.add_parser('events', help='Show a job event timeline')
+    job_events.add_argument('job_id')
+
+    options = parser.parse_args(arguments)
+    manager = copilot._require_job_manager()
+
+    if options.resource == 'project':
+        if options.action == 'create':
+            project = copilot.create_project(options.name, options.sources)
+            payload = {
+                'project': project.to_dict(),
+                'sources': [source.to_dict() for source in manager.list_sources(project.id)],
+            }
+        elif options.action == 'list':
+            payload = [
+                {
+                    **project.to_dict(),
+                    'source_count': len(manager.list_sources(project.id)),
+                    'job_count': len(manager.list_jobs(project_id=project.id)),
+                }
+                for project in manager.list_projects()
+            ]
+        elif options.action == 'show':
+            project = manager.get_project(options.project_id)
+            if not project:
+                raise ValueError(f'Project not found: {options.project_id}')
+            payload = {
+                'project': project.to_dict(),
+                'sources': [source.to_dict() for source in manager.list_sources(project.id)],
+                'jobs': [job.to_dict() for job in manager.list_jobs(project_id=project.id)],
+            }
+        else:
+            payload = [
+                copilot.add_project_source(options.project_id, source).to_dict()
+                for source in options.sources
+            ]
+    elif options.action == 'enqueue':
+        jobs = copilot.queue_project(options.project_id, ' '.join(options.request))
+        payload = [job.to_dict() for job in jobs]
+    elif options.action == 'list':
+        payload = [
+            job.to_dict()
+            for job in manager.list_jobs(options.project_id, options.state)
+        ]
+    elif options.action == 'run':
+        payload = [
+            job.to_dict()
+            for job in copilot.run_queued_jobs(options.project_id, options.limit)
+        ]
+    elif options.action == 'cancel':
+        payload = manager.request_cancel(options.job_id).to_dict()
+    elif options.action == 'retry':
+        payload = manager.retry_job(options.job_id).to_dict()
+    elif options.action == 'recover':
+        payload = manager.recover_interrupted_jobs(
+            stale_after_seconds=options.stale_seconds,
+            force=options.force,
+        )
     else:
-        copilot = VideoEditingCopilot()
-        copilot.run_interactive_mode()
+        payload = manager.list_events(options.job_id)
+
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    return 0
+
+
+def main() -> int:
+    """Main entry point."""
+    copilot = VideoEditingCopilot()
+    try:
+        if len(sys.argv) > 1 and sys.argv[1] in {'project', 'job'}:
+            return _run_management_cli(copilot, sys.argv[1:])
+        if len(sys.argv) > 1:
+            user_request = " ".join(sys.argv[1:])
+            response = copilot.process_video_request(user_request)
+            print(response)
+        else:
+            copilot.run_interactive_mode()
+        return 0
+    except (RuntimeError, ValueError) as error:
+        print(f'❌ {error}')
+        return 1
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

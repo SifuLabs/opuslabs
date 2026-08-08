@@ -67,10 +67,16 @@ consistent visual identity across exports.
 
 ## 5. Projects and batch jobs
 
-- [ ] Persist projects and processing state.
-- [ ] Use isolated working directories per job.
-- [ ] Add queues, progress, cancellation, retry, and resume.
-- [ ] Support processing several source videos in one project.
+- [x] Persist projects, source lists, job state, results, and event timelines in
+  a WAL-enabled SQLite database.
+- [x] Use UUID-scoped `input`, `temp`, `output`, and `checkpoints` directories
+  for every job so parallel workers cannot overwrite one another.
+- [x] Add atomic queue claims, monotonic progress, cooperative cancellation,
+  bounded retries, stale-worker recovery, and transcript/analysis checkpoints
+  for safe resume.
+- [x] Queue every source video in a project as an independent job and expose
+  project/job creation, status, execution, cancellation, retry, and recovery
+  through the canonical CLI.
 
 Acceptance check: interrupted work can resume safely and concurrent jobs do not
 overwrite one another.
@@ -113,6 +119,10 @@ only generic heuristics.
   regression, added dependency-light and dynamic face tracking, split layouts,
   image logos, persistent brand kits, transcript corrections, and translated
   subtitle sidecars. Sixteen tests and real smart/split/logo FFmpeg renders pass.
+- 2026-08-08: Completed phase 5. Added durable SQLite projects and job events,
+  isolated workspaces, atomic multi-worker claims, progress/cancellation/retry,
+  guarded stale-job recovery, reusable checkpoints, multi-source batches, and
+  CLI management. Twenty-two tests and a real checkpointed queued render pass.
 
 ## Resume point
 
@@ -120,8 +130,8 @@ only generic heuristics.
    OpenCV, and validate one translated subtitle request with the configured
    Gemini account. Add active-speaker selection only after that footage set is
    available for measuring subject-switch accuracy.
-2. Begin phase 5 with a persisted project/job model and isolated workspaces;
-   this is the dependency for reliable queues, cancellation, retry, and resume.
+2. Begin phase 6 by defining the provider-neutral publishing contract and a
+   local/mock draft provider before adding any credentialed OAuth integrations.
 3. The review workspace is under `review_workspace/`; its production build and
    rendered tests pass. Private deployment is still pending because the Sites
    create call returned no retrievable project id. Do not call create again

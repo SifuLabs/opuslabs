@@ -77,6 +77,35 @@ Default settings:
 
 All settings are customizable through the conversational interface.
 
+## Persistent projects and batch jobs
+
+Create a project with one or more local videos or URLs. Each source receives a
+separate isolated workspace and queued job:
+
+```bash
+python main.py project create "August launch" "episode-1.mp4" "episode-2.mp4"
+python main.py project list
+python main.py project add-source PROJECT_ID "episode-3.mp4"
+python main.py job enqueue PROJECT_ID "Create 3 clean YouTube Shorts with smart crop"
+python main.py job run --project PROJECT_ID
+python main.py job list --project PROJECT_ID
+```
+
+Jobs persist progress and an event timeline in SQLite. Manage interrupted or
+failed work with:
+
+```bash
+python main.py job cancel JOB_ID
+python main.py job retry JOB_ID
+python main.py job recover --stale-seconds 3600
+python main.py job events JOB_ID
+```
+
+Multiple `job run` processes may safely share the queue: claims are atomic and
+outputs live under `.opuslabs/workspaces/PROJECT_ID/JOB_ID/`. Transcript and
+clip-analysis checkpoints are reused after recovery. Use `job recover --force`
+only when you know no worker is still processing the persisted running jobs.
+
 ## Supported Input Formats
 
 - Video files: MP4, MOV, AVI, MKV

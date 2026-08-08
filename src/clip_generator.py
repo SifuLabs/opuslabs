@@ -100,13 +100,23 @@ class ClipGenerator:
         """
         try:
             clips_info = []
+            cancel_check = settings.get('_cancel_check')
+            progress_callback = settings.get('_progress_callback')
+            cancelled = False
             
             for i, segment in enumerate(engaging_segments):
                 print(f"✂️ Creating clip {i+1}/{len(engaging_segments)}...")
                 
+                if callable(cancel_check) and cancel_check():
+                    cancelled = True
+                    print('Clip generation stopped at a cancellation checkpoint.')
+                    break
+
                 clip_info = self._create_single_clip(
                     video_path, segment, i+1, settings
                 )
+                if callable(progress_callback):
+                    progress_callback(i + 1, len(engaging_segments))
                 
                 if clip_info:
                     clips_info.append(clip_info)
@@ -114,6 +124,9 @@ class ClipGenerator:
                     print(f"❌ Failed to create clip {i+1}")
             
             print(f"✅ Successfully created {len(clips_info)} clips!")
+            if cancelled:
+                return clips_info
+
             if clips_info and settings.get('create_thumbnails', True):
                 self.create_preview_thumbnails(clips_info)
 
