@@ -106,6 +106,93 @@ outputs live under `.opuslabs/workspaces/PROJECT_ID/JOB_ID/`. Transcript and
 clip-analysis checkpoints are reused after recovery. Use `job recover --force`
 only when you know no worker is still processing the persisted running jobs.
 
+## Approval-gated publishing drafts
+
+Publishing is deliberately two-step. First approve the exact clip bytes, then
+submit that approval to a provider:
+
+```bash
+python main.py publish approve "output/clip.mp4" --by "reviewer@example.com"
+python main.py publish submit "output/clip.mp4" \
+  --approval APPROVAL_ID \
+  --provider local \
+  --platform youtube_shorts \
+  --mode draft \
+  --title "A useful short" \
+  --caption "Watch this useful moment." \
+  --hashtag Shorts \
+  --privacy private
+python main.py publish list
+python main.py publish providers
+```
+
+Approvals contain a SHA-256 fingerprint. Editing or replacing a clip after
+approval invalidates it. The built-in `local` provider writes an auditable JSON
+draft under `.opuslabs/publishing/drafts/` and explicitly records that no
+external upload occurred.
+
+Live providers plug into the same draft/direct/schedule contract. OAuth uses
+state validation and PKCE; token bundles never enter SQLite and are protected by
+Windows DPAPI or an installed OS keyring. No live OAuth adapters ship by default
+because each platform requires its own developer application, scopes, callback
+URL, and review. Check availability with:
+
+```bash
+python main.py account oauth-providers
+python main.py account list
+python main.py account disconnect ACCOUNT_ID
+```
+
+## Analytics feedback loop
+
+Import actual clip outcomes from a UTF-8 JSON or CSV export. Imports are
+idempotent, so importing the same file again does not double-count results:
+
+```bash
+python main.py analytics schema
+python main.py analytics import "analytics-export.json"
+python main.py analytics report
+python main.py analytics report --platform youtube_shorts --style educational
+python main.py analytics list --platform youtube_shorts --limit 25
+```
+
+JSON accepts an array or a `records` array. This publication-linked example is
+enriched with the approved clip path, fingerprint, provider, and platform:
+
+```json
+{
+  "records": [
+    {
+      "publication_id": "PUBLICATION_ID",
+      "style": "educational",
+      "segment_type": "explanation",
+      "keywords": ["workflow", "editing"],
+      "predicted_engagement_score": 7.8,
+      "views": 12500,
+      "engaged_views": 8100,
+      "retention_percent": 64.5,
+      "shares": 410,
+      "conversions": 95,
+      "observed_at": "2026-08-08T12:00:00Z"
+    }
+  ]
+}
+```
+
+Rows may instead use `clip_sha256` or `clip_path`. To reuse generated metadata,
+provide `manifest_path` plus `clip_number`; the importer fills the platform,
+style, prediction, segment type, keywords, and clip link from
+`clip_manifest.json`. CSV uses the same field names. Run `analytics schema` for
+the complete contract.
+
+Reports compare predicted engagement with a transparent 0-10 observed score
+derived from retention, engaged-view rate, shares, and conversions. Each
+style/platform recommendation includes its observed sample size and rates.
+When history exists for future processing, the analyzer requests a wider
+candidate pool and reranks it using confidence-shrunk outcomes for style,
+segment type, and keywords. Original AI prediction values are preserved, and
+queued jobs save the reranking evidence in their checkpoints.
+
 ## Supported Input Formats
 
 - Video files: MP4, MOV, AVI, MKV

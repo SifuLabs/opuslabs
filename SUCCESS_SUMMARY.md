@@ -1,5 +1,10 @@
 # 🎉 SUCCESS! Video Editing Copilot Working
 
+> Historical troubleshooting record: this captures the early prototype state.
+> The current application uses `main.py`; see `README.md` for operation and
+> `IMPLEMENTATION_PLAN.md` for the completed phases and remaining external
+> validation work.
+
 ## ✅ PROBLEM SOLVED!
 
 Your original error:

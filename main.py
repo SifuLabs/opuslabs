@@ -46,6 +46,19 @@ except Exception:
     JobRecord = None
     ProjectRecord = None
 
+try:
+    from src.oauth_connections import OAuthConnectionService
+    from src.publishing import PublishRequest, create_default_publishing_service
+except Exception:
+    OAuthConnectionService = None
+    PublishRequest = None
+    create_default_publishing_service = None
+
+try:
+    from src.analytics import AnalyticsService
+except Exception:
+    AnalyticsService = None
+
 # Load environment variables from .env file
 try:
     from dotenv import load_dotenv
@@ -68,6 +81,32 @@ class VideoEditingCopilot:
         self.job_manager = JobManager() if JobManager else None
         if self.job_manager:
             self.available_features.add('projects_and_jobs')
+        self.publishing_service = (
+            create_default_publishing_service()
+            if create_default_publishing_service
+            else None
+        )
+        self.oauth_connections = (
+            OAuthConnectionService(
+                store=self.publishing_service.store,
+                token_vault=self.publishing_service.token_vault,
+            )
+            if self.publishing_service and OAuthConnectionService
+            else None
+        )
+        if self.publishing_service:
+            self.available_features.add('local_publish_drafts')
+        self.analytics_service = (
+            AnalyticsService.create_default(
+                publication_store=(
+                    self.publishing_service.store if self.publishing_service else None
+                )
+            )
+            if AnalyticsService
+            else None
+        )
+        if self.analytics_service:
+            self.available_features.add('analytics_feedback')
         
         # Core conversation templates
         self.style_keywords = {
@@ -430,6 +469,69 @@ class VideoEditingCopilot:
             raise RuntimeError('Persistent project support is unavailable.')
         return self.job_manager
 
+    def _require_publishing_service(self) -> Any:
+        if not self.publishing_service:
+            raise RuntimeError('Publishing support is unavailable.')
+        return self.publishing_service
+
+    def _require_analytics_service(self) -> Any:
+        analytics = getattr(self, 'analytics_service', None)
+        if not analytics:
+            raise RuntimeError('Analytics feedback support is unavailable.')
+        return analytics
+
+    def _analytics_candidate_pool_size(
+        self,
+        requested_count: int,
+        platform: str,
+    ) -> int:
+        analytics = getattr(self, 'analytics_service', None)
+        if not analytics:
+            return requested_count
+        return analytics.candidate_pool_size(requested_count, platform)
+
+    def _rerank_clip_candidates(
+        self,
+        segments: List[Any],
+        preferences: Dict[str, Any],
+        limit: int,
+    ) -> Tuple[List[Any], Dict[str, Any]]:
+        analytics = getattr(self, 'analytics_service', None)
+        if not analytics:
+            return list(segments)[:limit], {
+                'applied': False,
+                'observation_count': 0,
+                'candidates': [],
+            }
+        ranked, evidence = analytics.rerank_segments(
+            segments,
+            platform=preferences.get('platform', 'general'),
+            requested_style=preferences.get('style', 'engaging'),
+        )
+        if evidence.get('applied'):
+            print(
+                'Analytics reranked clip candidates using '
+                f'{evidence.get("observation_count", 0)} observed result(s).'
+            )
+        return ranked[:limit], evidence
+
+    def approve_clip_for_publishing(
+        self,
+        clip_path: str,
+        approved_by: str,
+        note: str = '',
+    ) -> Any:
+        """Persist approval evidence tied to the current clip fingerprint."""
+        return self._require_publishing_service().store.create_approval(
+            clip_path,
+            approved_by,
+            note,
+        )
+
+    def submit_publication(self, request: Any) -> Any:
+        """Submit an approval-gated provider-neutral publishing request."""
+        return self._require_publishing_service().submit(request)
+
     def create_project(self, name: str, sources: Optional[List[str]] = None) -> Any:
         """Create a durable multi-source project."""
         return self._require_job_manager().create_project(name, sources or [])
@@ -642,12 +744,21 @@ class VideoEditingCopilot:
 
             print("🧠 Analyzing content for engaging moments...")
             analyzer = GeminiTranscriptAnalyzer()
+            candidate_count = self._analytics_candidate_pool_size(
+                clip_count,
+                preferences.get('platform', 'general'),
+            )
             engaging_segments = analyzer.find_engaging_moments(
                 transcript,
-                target_clips=clip_count,
+                target_clips=candidate_count,
                 min_length=min_len,
                 max_length=max_len,
                 style=style
+            )
+            engaging_segments, _reranking = self._rerank_clip_candidates(
+                engaging_segments,
+                preferences,
+                clip_count,
             )
 
             if not engaging_segments:
@@ -783,12 +894,21 @@ class VideoEditingCopilot:
             print('⚡ Reusing clip-analysis checkpoint')
         else:
             analyzer = GeminiTranscriptAnalyzer()
+            candidate_count = self._analytics_candidate_pool_size(
+                clip_count,
+                preferences.get('platform', 'general'),
+            )
             engaging_segments = analyzer.find_engaging_moments(
                 transcript,
-                target_clips=clip_count,
+                target_clips=candidate_count,
                 min_length=min_len,
                 max_length=max_len,
                 style=style,
+            )
+            engaging_segments, reranking = self._rerank_clip_candidates(
+                engaging_segments,
+                preferences,
+                clip_count,
             )
             if engaging_segments:
                 manager.write_checkpoint(
@@ -796,6 +916,7 @@ class VideoEditingCopilot:
                     'segments',
                     [asdict(segment) for segment in engaging_segments],
                 )
+                manager.write_checkpoint(job_id, 'reranking', reranking)
         if not engaging_segments:
             raise RuntimeError(
                 'No engaging segments found. Try a different style or verify the source speech.'
@@ -1598,8 +1719,73 @@ def _run_management_cli(copilot: VideoEditingCopilot, arguments: List[str]) -> i
     job_events = job_commands.add_parser('events', help='Show a job event timeline')
     job_events.add_argument('job_id')
 
+    publish_parser = command_parsers.add_parser('publish', help='Approve and submit clips')
+    publish_commands = publish_parser.add_subparsers(dest='action', required=True)
+    publish_commands.add_parser('providers', help='List publishing capabilities')
+    approve_publish = publish_commands.add_parser('approve', help='Approve exact clip bytes')
+    approve_publish.add_argument('clip_path')
+    approve_publish.add_argument('--by', required=True, dest='approved_by')
+    approve_publish.add_argument('--note', default='')
+    submit_publish = publish_commands.add_parser('submit', help='Submit a provider request')
+    submit_publish.add_argument('clip_path')
+    submit_publish.add_argument('--approval', required=True, dest='approval_id')
+    submit_publish.add_argument('--provider', default='local')
+    submit_publish.add_argument('--platform', default='general')
+    submit_publish.add_argument('--mode', choices=['draft', 'publish', 'schedule'], default='draft')
+    submit_publish.add_argument('--title', required=True)
+    submit_publish.add_argument('--caption', default='')
+    submit_publish.add_argument('--hashtag', action='append', default=[], dest='hashtags')
+    submit_publish.add_argument('--privacy', choices=['private', 'unlisted', 'public'], default='private')
+    submit_publish.add_argument('--account', dest='account_id')
+    submit_publish.add_argument('--scheduled-at')
+    submit_publish.add_argument('--idempotency-key')
+    list_publications = publish_commands.add_parser('list', help='List publication records')
+    list_publications.add_argument(
+        '--state',
+        choices=['submitting', 'drafted', 'published', 'scheduled', 'failed'],
+    )
+    show_publication = publish_commands.add_parser('show', help='Show a publication record')
+    show_publication.add_argument('publication_id')
+
+    account_parser = command_parsers.add_parser('account', help='Inspect publishing accounts')
+    account_commands = account_parser.add_subparsers(dest='action', required=True)
+    list_accounts = account_commands.add_parser('list', help='List connected account metadata')
+    list_accounts.add_argument('--provider')
+    account_commands.add_parser('oauth-providers', help='List installed OAuth adapters')
+    disconnect_account = account_commands.add_parser('disconnect', help='Delete an account and its tokens')
+    disconnect_account.add_argument('account_id')
+
+    analytics_parser = command_parsers.add_parser(
+        'analytics',
+        help='Import observed performance and inspect feedback',
+    )
+    analytics_commands = analytics_parser.add_subparsers(dest='action', required=True)
+    import_analytics = analytics_commands.add_parser(
+        'import',
+        help='Import a UTF-8 JSON or CSV metrics export',
+    )
+    import_analytics.add_argument('source_path')
+    report_analytics = analytics_commands.add_parser(
+        'report',
+        help='Compare predicted and observed performance',
+    )
+    report_analytics.add_argument('--platform')
+    report_analytics.add_argument('--style')
+    list_analytics = analytics_commands.add_parser(
+        'list',
+        help='List normalized performance observations',
+    )
+    list_analytics.add_argument('--platform')
+    list_analytics.add_argument('--style')
+    list_analytics.add_argument('--limit', type=int, default=100)
+    analytics_commands.add_parser('schema', help='Show the provider-neutral import schema')
+
     options = parser.parse_args(arguments)
-    manager = copilot._require_job_manager()
+    manager = (
+        copilot._require_job_manager()
+        if options.resource in {'project', 'job'}
+        else None
+    )
 
     if options.resource == 'project':
         if options.action == 'create':
@@ -1631,6 +1817,78 @@ def _run_management_cli(copilot: VideoEditingCopilot, arguments: List[str]) -> i
                 copilot.add_project_source(options.project_id, source).to_dict()
                 for source in options.sources
             ]
+    elif options.resource == 'publish':
+        publishing = copilot._require_publishing_service()
+        if options.action == 'providers':
+            payload = [
+                capabilities.to_dict()
+                for capabilities in publishing.registry.list_capabilities()
+            ]
+        elif options.action == 'approve':
+            payload = copilot.approve_clip_for_publishing(
+                options.clip_path,
+                options.approved_by,
+                options.note,
+            ).to_dict()
+        elif options.action == 'submit':
+            payload = copilot.submit_publication(PublishRequest(
+                provider=options.provider,
+                platform=options.platform,
+                mode=options.mode,
+                clip_path=options.clip_path,
+                approval_id=options.approval_id,
+                title=options.title,
+                caption=options.caption,
+                hashtags=options.hashtags,
+                privacy=options.privacy,
+                account_id=options.account_id,
+                scheduled_at=options.scheduled_at,
+                idempotency_key=options.idempotency_key,
+            )).to_dict()
+        elif options.action == 'list':
+            payload = [
+                publication.to_dict()
+                for publication in publishing.store.list_publications(options.state)
+            ]
+        else:
+            publication = publishing.store.get_publication(options.publication_id)
+            if not publication:
+                raise ValueError(f'Publication not found: {options.publication_id}')
+            payload = publication.to_dict()
+    elif options.resource == 'account':
+        publishing = copilot._require_publishing_service()
+        if options.action == 'list':
+            payload = [
+                account.to_dict()
+                for account in publishing.store.list_accounts(options.provider)
+            ]
+        elif options.action == 'oauth-providers':
+            payload = (
+                copilot.oauth_connections.adapters.list_providers()
+                if copilot.oauth_connections
+                else []
+            )
+        else:
+            if not copilot.oauth_connections:
+                raise RuntimeError('OAuth connection support is unavailable.')
+            payload = {'disconnected': copilot.oauth_connections.disconnect(options.account_id)}
+    elif options.resource == 'analytics':
+        analytics = copilot._require_analytics_service()
+        if options.action == 'import':
+            payload = analytics.import_file(options.source_path).to_dict()
+        elif options.action == 'report':
+            payload = analytics.build_report(options.platform, options.style)
+        elif options.action == 'list':
+            payload = [
+                observation.to_dict()
+                for observation in analytics.store.list_observations(
+                    platform=options.platform,
+                    style=options.style,
+                    limit=options.limit,
+                )
+            ]
+        else:
+            payload = analytics.import_schema()
     elif options.action == 'enqueue':
         jobs = copilot.queue_project(options.project_id, ' '.join(options.request))
         payload = [job.to_dict() for job in jobs]
@@ -1664,7 +1922,9 @@ def main() -> int:
     """Main entry point."""
     copilot = VideoEditingCopilot()
     try:
-        if len(sys.argv) > 1 and sys.argv[1] in {'project', 'job'}:
+        if len(sys.argv) > 1 and sys.argv[1] in {
+            'project', 'job', 'publish', 'account', 'analytics'
+        }:
             return _run_management_cli(copilot, sys.argv[1:])
         if len(sys.argv) > 1:
             user_request = " ".join(sys.argv[1:])

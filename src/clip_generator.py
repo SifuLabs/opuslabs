@@ -179,6 +179,8 @@ class ClipGenerator:
                 'hashtags': segment.hashtags,
                 'keywords': segment.keywords,
                 'segment_type': segment.segment_type,
+                'style': settings.get('style') or segment.emotion or 'engaging',
+                'platform': settings.get('platform', 'general'),
                 'engagement_score': round(segment.engagement_score, 2),
                 'start_time': segment.start_time,
                 'end_time': segment.end_time
@@ -823,6 +825,7 @@ class ClipGenerator:
         payload = {
             'schema_version': 1,
             'platform': settings.get('platform', 'general'),
+            'style': settings.get('style', 'engaging'),
             'reframe_mode': settings.get('reframe_mode', 'blur'),
             'captions_burned_in': bool(settings.get('add_captions', True)),
             'caption_theme': settings.get('caption_theme', 'bold'),

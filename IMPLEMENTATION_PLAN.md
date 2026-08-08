@@ -83,23 +83,42 @@ overwrite one another.
 
 ## 6. Publishing integrations
 
-- [ ] Define a provider-neutral publishing interface.
-- [ ] Add OAuth account connections and secure token storage.
-- [ ] Add draft upload first, then direct publishing and scheduling.
-- [ ] Validate privacy, metadata, and platform-specific requirements.
+- [x] Define a provider-neutral capability, validation, draft, direct-publish,
+  and scheduling interface with an extensible provider registry.
+- [x] Add state-checked PKCE OAuth connection orchestration. OAuth token bundles
+  are kept out of SQLite and stored with Windows DPAPI or an OS keyring.
+- [x] Add an approval-gated local draft provider and durable, idempotent
+  publication records. The same contract supports tested fake direct and
+  scheduled providers without allowing the local provider to claim an upload.
+- [x] Validate the exact approved clip fingerprint, provider/account match,
+  media type, privacy, scheduling time, title/caption limits, hashtags, and
+  provider-owned platform requirements before submission.
+- [!] Live OAuth adapters and external uploads require platform developer
+  applications, approved scopes, callback URLs, and credentials. None are
+  configured, so the CLI accurately lists no live OAuth providers.
 
 Acceptance check: supported platforms can receive an approved clip as a draft.
 Live integrations require the relevant developer applications and credentials.
 
 ## 7. Analytics feedback loop
 
-- [ ] Import views, engaged views, retention, shares, and conversions.
-- [ ] Compare predicted engagement with actual results.
-- [ ] Surface per-style and per-platform recommendations.
-- [ ] Use historical outcomes to rerank future clip candidates.
+- [x] Import provider-neutral JSON/CSV views, engaged views, retention, shares,
+  and conversions into an idempotent, WAL-enabled SQLite history. Every row is
+  tied to publication metadata, a clip fingerprint/path, or a clip manifest.
+- [x] Compare the original predicted engagement score with a transparent
+  observed-performance score and report calibration error without rewriting the
+  original prediction.
+- [x] Surface per-style and per-platform recommendations whose messages include
+  the observed result count, views, retention, engaged-view rate, share rate,
+  conversion rate, and cohort uplift.
+- [x] Expand the future candidate pool when history exists, then rerank it with
+  confidence-shrunk style, segment-type, and keyword outcomes. Job checkpoints
+  preserve both the chosen candidates and the evidence used to order them.
 
 Acceptance check: recommendations cite observed project performance instead of
-only generic heuristics.
+only generic heuristics. Verified with JSON/CSV, manifest/publication linkage,
+rollback, idempotency, calibration, recommendation, reranking, CLI, and full
+regression tests.
 
 ## Change log
 
@@ -123,6 +142,14 @@ only generic heuristics.
   isolated workspaces, atomic multi-worker claims, progress/cancellation/retry,
   guarded stale-job recovery, reusable checkpoints, multi-source batches, and
   CLI management. Twenty-two tests and a real checkpointed queued render pass.
+- 2026-08-08: Completed the credential-free phase 6 foundation. Added exact-file
+  approvals, provider-neutral publishing, durable/idempotent records, safe local
+  drafts, PKCE OAuth orchestration, and DPAPI/keyring token storage. Twenty-eight
+  tests and a publishing CLI smoke draft pass; live providers remain credential-gated.
+- 2026-08-08: Completed phase 7. Added provider-neutral and idempotent analytics
+  imports, publication/manifest linkage, predicted-versus-observed calibration,
+  evidence-citing style/platform recommendations, and history-aware candidate
+  reranking. Thirty-four tests pass, including the analytics CLI workflow.
 
 ## Resume point
 
@@ -130,9 +157,13 @@ only generic heuristics.
    OpenCV, and validate one translated subtitle request with the configured
    Gemini account. Add active-speaker selection only after that footage set is
    available for measuring subject-switch accuracy.
-2. Begin phase 6 by defining the provider-neutral publishing contract and a
-   local/mock draft provider before adding any credentialed OAuth integrations.
-3. The review workspace is under `review_workspace/`; its production build and
+2. Add the first live publishing adapter only after its developer application,
+   scopes, redirect URI, and test account are available. Keep draft creation as
+   the default until platform review and user validation are complete.
+3. Validate phase 7 weights against a representative set of real account
+   exports. The offline import and feedback loop is complete; live analytics
+   fetchers should wait for approved platform scopes and sample exports.
+4. The review workspace is under `review_workspace/`; its production build and
    rendered tests pass. Private deployment is still pending because the Sites
    create call returned no retrievable project id. Do not call create again
    until the existing site state can be discovered safely.

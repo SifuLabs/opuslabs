@@ -1,5 +1,10 @@
 # 🎬 Video Editing Copilot Agent - Complete Project Summary
 
+> Historical snapshot: this document describes the original prototype and
+> contains legacy entrypoint references. For the current 2026 implementation,
+> use `main.py`, `README.md`, and `IMPLEMENTATION_PLAN.md`. Phases 1-7 in that
+> ledger are implemented; 34 automated tests currently pass.
+
 ## 🚀 Project Status: COMPLETE & WORKING ✅
 
 Successfully created a fully functional **Video Editing Copilot Agent** that transforms long-form videos into viral short clips using Google Gemini AI.
