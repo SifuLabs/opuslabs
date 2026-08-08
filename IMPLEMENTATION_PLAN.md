@@ -47,16 +47,20 @@ or using a terminal.
 
 ## 4. Smart reframing and brand controls
 
-- [-] Detect visible faces and use their median position as a stable smart-crop
-  focus. The implementation is present but its syntax/tests were not run because
-  the final validation command was interrupted. Dynamic tracking and active
-  speaker selection remain planned.
-- [-] `smart`, `blur`, `crop`, and `fit` modes are implemented. Conversation
-  and split-screen layouts remain planned.
-- [-] Bold, clean, and minimal caption themes, safe positions, custom caption
-  color/size, and a safe-zone brand label are implemented but not yet verified.
-  Image logos and saved brand kits remain planned.
-- [ ] Add transcript correction and multilingual subtitle/translation controls.
+- [x] Detect visible faces, stabilize their sampled positions, and interpolate
+  a moving smart-crop focus throughout each clip. The renderer safely falls
+  back to a centered crop when OpenCV or a detectable face is unavailable.
+  Audio-visual active-speaker selection remains a future enhancement.
+- [x] Add `smart`, `blur`, `crop`, `fit`, and two-speaker `split`/conversation
+  layouts and verify their FFmpeg filter graphs with real renders.
+- [x] Add bold, clean, and minimal caption themes, safe positions, custom
+  caption color/size, text labels, raster image logos, and persistent named
+  brand kits.
+- [x] Apply direct or JSON-file transcript corrections before clip selection,
+  and export optional translated SRT sidecars while retaining source timings.
+- [!] Live translation requires `google-genai` and Gemini credentials. The
+  schema-constrained translation path and SRT output are covered offline, but
+  an API call was intentionally not made during local validation.
 
 Acceptance check: users can keep important subjects visible and reuse a
 consistent visual identity across exports.
@@ -105,18 +109,20 @@ only generic heuristics.
 - 2026-08-07: Began phase 4. Added face-sampled smart-crop focus, caption themes,
   safe caption positioning, custom colors/sizes, and text brand labels. Work was
   paused before syntax and regression validation at the user's request.
+- 2026-08-08: Completed phase 4 implementation. Repaired a manifest-export
+  regression, added dependency-light and dynamic face tracking, split layouts,
+  image logos, persistent brand kits, transcript corrections, and translated
+  subtitle sidecars. Sixteen tests and real smart/split/logo FFmpeg renders pass.
 
 ## Resume point
 
-1. Run an AST parse of `main.py` and `src/clip_generator.py`. The previous
-   syntax command was interrupted before returning a result.
-2. Extend `tests/test_export_pipeline.py` for `smart` reframing, caption themes,
-   brand labels, and the new natural-language preferences.
-3. Run all Python tests and a real two-second smart-crop FFmpeg smoke render.
-4. If validation passes, mark the implemented phase 4 items complete and add
-   dynamic subject tracking, split-screen layouts, image logos, and brand-kit
-   persistence.
-5. The review workspace is under `review_workspace/`; its production build and
+1. Validate face tracking against representative real footage after installing
+   OpenCV, and validate one translated subtitle request with the configured
+   Gemini account. Add active-speaker selection only after that footage set is
+   available for measuring subject-switch accuracy.
+2. Begin phase 5 with a persisted project/job model and isolated workspaces;
+   this is the dependency for reliable queues, cancellation, retry, and resume.
+3. The review workspace is under `review_workspace/`; its production build and
    rendered tests pass. Private deployment is still pending because the Sites
    create call returned no retrievable project id. Do not call create again
    until the existing site state can be discovered safely.

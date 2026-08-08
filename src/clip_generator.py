@@ -9,10 +9,10 @@ import sys
 import subprocess
 import json
 import csv
+from statistics import median
 from typing import Dict, List, Optional, Tuple
 from pathlib import Path
 import tempfile
-import numpy as np
 
 if hasattr(sys.stdout, 'reconfigure'):
     sys.stdout.reconfigure(encoding='utf-8', errors='replace')
@@ -53,6 +53,7 @@ except ImportError:
 
 from .gemini_analyzer import EngagingSegment
 from .content_strategy import ContentStrategyBuilder
+from .subtitle_translator import SubtitleTranslator, normalize_language
 
 class ClipGenerator:
     """Generates video clips from engaging segments"""
@@ -68,6 +69,7 @@ class ClipGenerator:
         self.target_height = int(os.getenv('OUTPUT_HEIGHT', 1920))
         self.target_fps = int(os.getenv('OUTPUT_FPS', 30))
         self.content_strategy = ContentStrategyBuilder()
+        self.subtitle_translator = SubtitleTranslator()
         
         # Caption settings
         self.caption_style = {
@@ -172,6 +174,13 @@ class ClipGenerator:
                 subtitle_path = self._write_subtitles(segment, output_path)
                 if subtitle_path:
                     clip_info['subtitle_path'] = subtitle_path
+                translated_subtitles = self._write_translated_subtitles(
+                    segment,
+                    output_path,
+                    settings.get('subtitle_languages', []),
+                )
+                if translated_subtitles:
+                    clip_info['translated_subtitles'] = translated_subtitles
             clip_info['content_package'] = self.content_strategy.build_for_clip(
                 clip_info,
                 settings
@@ -273,11 +282,17 @@ class ClipGenerator:
                 'ffmpeg',
                 '-ss', str(segment.start_time),
                 '-i', video_path,
-                '-t', str(duration),
             ]
 
-            reframe_mode = str(settings.get('reframe_mode', 'blur')).lower()
-            if reframe_mode not in {'blur', 'crop', 'fit', 'smart'}:
+            logo_path = self._resolve_brand_logo(settings)
+            if logo_path:
+                cmd.extend(['-i', logo_path])
+            cmd.extend(['-t', str(duration)])
+
+            reframe_mode = str(settings.get('reframe_mode', 'blur')).strip().lower()
+            if reframe_mode == 'conversation':
+                reframe_mode = 'split'
+            if reframe_mode not in {'blur', 'crop', 'fit', 'smart', 'split'}:
                 reframe_mode = 'blur'
 
             caption_filters = (
@@ -302,9 +317,40 @@ class ClipGenerator:
                     f"force_original_aspect_ratio=decrease[fg2];"
                     f"[bg2][fg2]overlay=(W-w)/2:(H-h)/2"
                 )
-                if caption_filters:
-                    filter_complex += ',' + ','.join(caption_filters)
-                filter_complex += '[vout]'
+                filter_complex = self._finish_complex_video_filter(
+                    filter_complex,
+                    caption_filters,
+                    settings,
+                    logo_path,
+                )
+                cmd.extend([
+                    '-filter_complex', filter_complex,
+                    '-map', '[vout]',
+                    '-map', '0:a?',
+                ])
+            elif reframe_mode == 'split':
+                top_height = self.target_height // 2
+                bottom_height = self.target_height - top_height
+                filter_complex = (
+                    f"[0:v]split=2[panel1][panel2];"
+                    f"[panel1]scale={self.target_width}:{top_height}:"
+                    f"force_original_aspect_ratio=increase,"
+                    f"crop={self.target_width}:{top_height}:"
+                    f"x='max(0,min(iw-ow,iw*0.25-ow/2))':"
+                    f"y='max(0,(ih-oh)/2)'[top];"
+                    f"[panel2]scale={self.target_width}:{bottom_height}:"
+                    f"force_original_aspect_ratio=increase,"
+                    f"crop={self.target_width}:{bottom_height}:"
+                    f"x='max(0,min(iw-ow,iw*0.75-ow/2))':"
+                    f"y='max(0,(ih-oh)/2)'[bottom];"
+                    f"[top][bottom]vstack=inputs=2"
+                )
+                filter_complex = self._finish_complex_video_filter(
+                    filter_complex,
+                    caption_filters,
+                    settings,
+                    logo_path,
+                )
                 cmd.extend([
                     '-filter_complex', filter_complex,
                     '-map', '[vout]',
@@ -312,15 +358,25 @@ class ClipGenerator:
                 ])
             else:
                 if reframe_mode in {'crop', 'smart'}:
-                    focus_x, focus_y = (0.5, 0.5)
+                    focus_x_expression = '0.5000'
+                    focus_y_expression = '0.5000'
                     if reframe_mode == 'smart':
-                        focus_x, focus_y = self._detect_subject_center(video_path, segment)
+                        subject_track = self._detect_subject_track(video_path, segment)
+                        if subject_track:
+                            focus_x_expression = self._build_tracking_expression(
+                                subject_track,
+                                coordinate_index=1,
+                            )
+                            focus_y_expression = self._build_tracking_expression(
+                                subject_track,
+                                coordinate_index=2,
+                            )
                     vf_parts = [
                         f"scale={self.target_width}:{self.target_height}:"
                         f"force_original_aspect_ratio=increase",
                         f"crop={self.target_width}:{self.target_height}:"
-                        f"x='max(0,min(iw-ow,iw*{focus_x:.4f}-ow/2))':"
-                        f"y='max(0,min(ih-oh,ih*{focus_y:.4f}-oh/2))'",
+                        f"x='max(0,min(iw-ow,iw*({focus_x_expression})-ow/2))':"
+                        f"y='max(0,min(ih-oh,ih*({focus_y_expression})-oh/2))'",
                     ]
                 else:
                     vf_parts = [
@@ -330,7 +386,21 @@ class ClipGenerator:
                         f"(ow-iw)/2:(oh-ih)/2:color=black",
                     ]
                 vf_parts.extend(caption_filters)
-                cmd.extend(['-vf', ','.join(vf_parts)])
+                if logo_path:
+                    filter_complex = f"[0:v]{','.join(vf_parts)}"
+                    filter_complex = self._finish_complex_video_filter(
+                        filter_complex,
+                        [],
+                        settings,
+                        logo_path,
+                    )
+                    cmd.extend([
+                        '-filter_complex', filter_complex,
+                        '-map', '[vout]',
+                        '-map', '0:a?',
+                    ])
+                else:
+                    cmd.extend(['-vf', ','.join(vf_parts)])
 
             cmd.extend([
                 '-r', str(self.target_fps),
@@ -393,9 +463,9 @@ class ClipGenerator:
           segment text) displayed for the whole clip duration.
 
         All captions are:
-          - Large bold font (72 pt at 1080-wide)
-          - Yellow text with a thick black stroke for maximum legibility
-          - Horizontally centred, positioned at 78 % of the frame height
+          - Sized and grouped according to the selected theme
+          - Customizable text color with a black legibility stroke
+          - Horizontally centered in a top, middle, or bottom safe position
           - Wrapped at ~20 chars per line by drawtext's built-in :line_spacing
         """
         settings = settings or {}
@@ -404,12 +474,18 @@ class ClipGenerator:
             'clean': {'words': 5, 'size': 58, 'stroke': 3, 'box': '0x11111188', 'border': 10},
             'minimal': {'words': 7, 'size': 48, 'stroke': 2, 'box': '0x00000055', 'border': 8},
         }
-        theme = themes.get(str(settings.get('caption_theme', 'bold')), themes['bold'])
+        theme_name = str(settings.get('caption_theme', 'bold')).strip().lower()
+        theme = themes.get(theme_name, themes['bold'])
         WORDS_PER_GROUP = int(theme['words'])
-        FONT_SIZE       = int(settings.get('caption_font_size', theme['size']))
+        try:
+            requested_size = int(settings.get('caption_font_size', theme['size']))
+        except (TypeError, ValueError):
+            requested_size = int(theme['size'])
+        FONT_SIZE       = min(160, max(24, requested_size))
         STROKE_W        = int(theme['stroke'])
         positions = {'top': 'h*0.16', 'middle': 'h*0.48', 'bottom': 'h*0.78'}
-        Y_POS           = positions.get(str(settings.get('caption_position', 'bottom')), 'h*0.78')
+        position_name   = str(settings.get('caption_position', 'bottom')).strip().lower()
+        Y_POS           = positions.get(position_name, 'h*0.78')
         X_POS           = '(w-text_w)/2'
         TEXT_COLOR      = self._safe_ffmpeg_color(settings.get('caption_color', 'white'), 'white')
         STROKE_COLOR    = 'black'
@@ -632,6 +708,18 @@ class ClipGenerator:
     ) -> Optional[str]:
         """Write editable SRT subtitles next to a generated clip."""
         subtitle_path = str(Path(output_path).with_suffix('.srt'))
+        cues = self._build_subtitle_cues(segment, words_per_cue)
+        if not cues:
+            return None
+        self._write_srt_cues(subtitle_path, cues)
+        return subtitle_path
+
+    def _build_subtitle_cues(
+        self,
+        segment: EngagingSegment,
+        words_per_cue: int = 6,
+    ) -> List[Tuple[float, float, str]]:
+        """Build editable subtitle cues independently from their output language."""
         clip_duration = max(0.0, segment.end_time - segment.start_time)
         cues: List[Tuple[float, float, str]] = []
         words = segment.word_segments or []
@@ -655,8 +743,16 @@ class ClipGenerator:
             cues.append((0.0, clip_duration, segment.text.strip()))
 
         if not cues:
-            return None
+            return []
 
+        return cues
+
+    def _write_srt_cues(
+        self,
+        subtitle_path: str,
+        cues: List[Tuple[float, float, str]],
+    ) -> None:
+        """Write already-timed cues to an SRT file."""
         lines: List[str] = []
         for number, (start, end, text) in enumerate(cues, start=1):
             lines.extend([
@@ -666,7 +762,42 @@ class ClipGenerator:
                 '',
             ])
         Path(subtitle_path).write_text('\n'.join(lines), encoding='utf-8')
-        return subtitle_path
+
+    def _write_translated_subtitles(
+        self,
+        segment: EngagingSegment,
+        output_path: str,
+        languages: List[str],
+    ) -> Dict[str, str]:
+        """Write optional translated SRT sidecars while preserving source timings."""
+        if isinstance(languages, str):
+            languages = [languages]
+        normalized_languages = []
+        for language in languages or []:
+            normalized = normalize_language(language)
+            if normalized and normalized not in normalized_languages:
+                normalized_languages.append(normalized)
+        normalized_languages = normalized_languages[:5]
+        if not normalized_languages:
+            return {}
+        if not self.subtitle_translator.available:
+            print('Translated subtitles skipped: Gemini credentials/SDK are unavailable.')
+            return {}
+
+        cues = self._build_subtitle_cues(segment)
+        translated_paths: Dict[str, str] = {}
+        for language in normalized_languages:
+            translated_texts = self.subtitle_translator.translate_cues(cues, language)
+            if not translated_texts or len(translated_texts) != len(cues):
+                continue
+            translated_cues = [
+                (start, end, translated_text)
+                for (start, end, _), translated_text in zip(cues, translated_texts)
+            ]
+            subtitle_path = str(Path(output_path).with_suffix(f'.{language}.srt'))
+            self._write_srt_cues(subtitle_path, translated_cues)
+            translated_paths[language] = subtitle_path
+        return translated_paths
     
     def export_clip_manifest(
         self,
@@ -681,93 +812,13 @@ class ClipGenerator:
             'platform': settings.get('platform', 'general'),
             'reframe_mode': settings.get('reframe_mode', 'blur'),
             'captions_burned_in': bool(settings.get('add_captions', True)),
+            'caption_theme': settings.get('caption_theme', 'bold'),
+            'brand_kit': settings.get('brand_kit'),
             'clips': clips_info,
         }
         manifest_path.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2),
             encoding='utf-8',
-        )
-
-    @staticmethod
-    def _safe_ffmpeg_color(value: any, fallback: str) -> str:
-        """Allow named or hexadecimal colors without filter injection."""
-        candidate = str(value or '').strip()
-        allowed = set('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789#x')
-        if candidate and len(candidate) <= 24 and all(char in allowed for char in candidate):
-            return candidate
-        return fallback
-
-    def _build_brand_filter(self, settings: Dict[str, any]) -> Optional[str]:
-        """Create a restrained, safe-zone brand label when requested."""
-        raw_label = str(settings.get('brand_label') or '').strip()
-        if not raw_label:
-            return None
-        label = self._esc(raw_label[:32].upper())
-        return (
-            f"drawtext=text='{label}'"
-            f":fontsize=30:fontcolor=white:borderw=2:bordercolor=black"
-            f":box=1:boxcolor=0x00000088:boxborderw=9"
-            f":x=40:y=54:fix_bounds=true"
-        )
-
-    def _detect_subject_center(
-        self,
-        video_path: str,
-        segment: EngagingSegment,
-        sample_count: int = 12,
-    ) -> Tuple[float, float]:
-        """Estimate a stable crop focus from faces sampled across the clip."""
-        if not CV2_AVAILABLE:
-            return 0.5, 0.5
-
-        capture = cv2.VideoCapture(video_path)
-        centers: List[Tuple[float, float]] = []
-        try:
-            cascade_path = os.path.join(
-                cv2.data.haarcascades,
-                'haarcascade_frontalface_default.xml',
-            )
-            detector = cv2.CascadeClassifier(cascade_path)
-            if detector.empty():
-                return 0.5, 0.5
-
-            sample_times = np.linspace(
-                segment.start_time,
-                segment.end_time,
-                max(2, sample_count),
-            )
-            for timestamp in sample_times:
-                capture.set(cv2.CAP_PROP_POS_MSEC, float(timestamp) * 1000)
-                success, frame = capture.read()
-                if not success or frame is None:
-                    continue
-                height, width = frame.shape[:2]
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                faces = detector.detectMultiScale(
-                    gray,
-                    scaleFactor=1.12,
-                    minNeighbors=5,
-                    minSize=(max(30, width // 16), max(30, height // 16)),
-                )
-                if len(faces):
-                    x, y, face_width, face_height = max(
-                        faces,
-                        key=lambda face: int(face[2]) * int(face[3]),
-                    )
-                    centers.append((
-                        (x + face_width / 2) / width,
-                        min(0.85, (y + face_height * 0.75) / height),
-                    ))
-        except Exception as error:
-            print(f"Smart reframing fallback: {error}")
-        finally:
-            capture.release()
-
-        if not centers:
-            return 0.5, 0.5
-        return (
-            float(np.median([center[0] for center in centers])),
-            float(np.median([center[1] for center in centers])),
         )
 
         fieldnames = [
@@ -798,6 +849,207 @@ class ClipGenerator:
         for clip in clips_info:
             clip['manifest_path'] = str(manifest_path)
         return {'json': str(manifest_path), 'csv': str(csv_path)}
+
+    @staticmethod
+    def _safe_ffmpeg_color(value: any, fallback: str) -> str:
+        """Allow named or hexadecimal colors without filter injection."""
+        candidate = str(value or '').strip()
+        allowed = set('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789#x')
+        if candidate and len(candidate) <= 24 and all(char in allowed for char in candidate):
+            return candidate
+        return fallback
+
+    def _build_brand_filter(self, settings: Dict[str, any]) -> Optional[str]:
+        """Create a restrained, safe-zone brand label when requested."""
+        raw_label = str(settings.get('brand_label') or '').strip()
+        if not raw_label:
+            return None
+        label = self._esc(raw_label[:32].upper())
+        return (
+            f"drawtext=text='{label}'"
+            f":fontsize=30:fontcolor=white:borderw=2:bordercolor=black"
+            f":box=1:boxcolor=0x00000088:boxborderw=9"
+            f":x=40:y=54:fix_bounds=true"
+        )
+
+    def _resolve_brand_logo(self, settings: Dict[str, any]) -> Optional[str]:
+        """Return a usable raster logo path or skip it with a clear warning."""
+        raw_path = str(settings.get('brand_logo') or '').strip().strip('"\'')
+        if not raw_path:
+            return None
+        logo_path = Path(raw_path).expanduser()
+        if logo_path.suffix.lower() not in {'.png', '.jpg', '.jpeg', '.webp'}:
+            print(f"Brand logo skipped (unsupported format): {logo_path}")
+            return None
+        if not logo_path.is_file():
+            print(f"Brand logo skipped (file not found): {logo_path}")
+            return None
+        return str(logo_path.resolve())
+
+    def _finish_complex_video_filter(
+        self,
+        base_filter: str,
+        overlay_filters: List[str],
+        settings: Dict[str, any],
+        logo_path: Optional[str],
+    ) -> str:
+        """Finish a complex video graph with text overlays and an optional logo."""
+        if overlay_filters:
+            base_filter += ',' + ','.join(overlay_filters)
+        if not logo_path:
+            return base_filter + '[vout]'
+
+        try:
+            requested_width = int(settings.get('brand_logo_width', self.target_width // 6))
+        except (TypeError, ValueError):
+            requested_width = self.target_width // 6
+        logo_width = min(self.target_width // 2, max(48, requested_width))
+        margin = max(16, min(80, self.target_width // 24))
+        positions = {
+            'top-left': (str(margin), str(margin)),
+            'top-right': (f'W-w-{margin}', str(margin)),
+            'bottom-left': (str(margin), f'H-h-{margin}'),
+            'bottom-right': (f'W-w-{margin}', f'H-h-{margin}'),
+        }
+        position_name = str(settings.get('brand_logo_position', 'top-right')).strip().lower()
+        x_position, y_position = positions.get(position_name, positions['top-right'])
+        opacity = settings.get('brand_logo_opacity', 0.9)
+        try:
+            opacity = min(1.0, max(0.1, float(opacity)))
+        except (TypeError, ValueError):
+            opacity = 0.9
+        return (
+            f"{base_filter}[video_base];"
+            f"[1:v]scale={logo_width}:-1,format=rgba,"
+            f"colorchannelmixer=aa={opacity:.2f}[brand_logo];"
+            f"[video_base][brand_logo]overlay={x_position}:{y_position}:"
+            f"eof_action=repeat[vout]"
+        )
+
+    @staticmethod
+    def _build_tracking_expression(
+        subject_track: List[Tuple[float, float, float]],
+        coordinate_index: int,
+    ) -> str:
+        """Build a piecewise-linear FFmpeg expression for a smoothed face track."""
+        if not subject_track:
+            return '0.5000'
+        ordered_track = sorted(subject_track, key=lambda point: point[0])
+        if len(ordered_track) == 1:
+            return f'{ordered_track[0][coordinate_index]:.4f}'
+
+        expression = f'{ordered_track[-1][coordinate_index]:.4f}'
+        for start, end in reversed(list(zip(ordered_track, ordered_track[1:]))):
+            start_time = float(start[0])
+            end_time = float(end[0])
+            span = end_time - start_time
+            if span <= 0:
+                continue
+            start_value = float(start[coordinate_index])
+            delta = float(end[coordinate_index]) - start_value
+            interpolated = (
+                f'{start_value:.4f}+({delta:.4f})*'
+                f'(t-{start_time:.3f})/{span:.3f}'
+            )
+            expression = (
+                f'if(between(t,{start_time:.3f},{end_time:.3f}),'
+                f'{interpolated},{expression})'
+            )
+        first_time = float(ordered_track[0][0])
+        first_value = float(ordered_track[0][coordinate_index])
+        return f'if(lt(t,{first_time:.3f}),{first_value:.4f},{expression})'
+
+    def _detect_subject_track(
+        self,
+        video_path: str,
+        segment: EngagingSegment,
+        sample_count: int = 12,
+    ) -> List[Tuple[float, float, float]]:
+        """Sample faces and return a stable, continuous subject track."""
+        if not CV2_AVAILABLE:
+            return []
+
+        capture = cv2.VideoCapture(video_path)
+        raw_track: List[Tuple[float, float, float]] = []
+        previous_center: Optional[Tuple[float, float]] = None
+        try:
+            cascade_path = os.path.join(
+                cv2.data.haarcascades,
+                'haarcascade_frontalface_default.xml',
+            )
+            detector = cv2.CascadeClassifier(cascade_path)
+            if detector.empty():
+                return []
+
+            count = max(2, int(sample_count))
+            sample_step = (segment.end_time - segment.start_time) / (count - 1)
+            sample_times = [
+                segment.start_time + (sample_step * index)
+                for index in range(count)
+            ]
+            for timestamp in sample_times:
+                capture.set(cv2.CAP_PROP_POS_MSEC, float(timestamp) * 1000)
+                success, frame = capture.read()
+                if not success or frame is None:
+                    continue
+                height, width = frame.shape[:2]
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                faces = detector.detectMultiScale(
+                    gray,
+                    scaleFactor=1.12,
+                    minNeighbors=5,
+                    minSize=(max(30, width // 16), max(30, height // 16)),
+                )
+                candidates = []
+                for x, y, face_width, face_height in faces:
+                    center_x = (x + face_width / 2) / width
+                    center_y = min(0.85, (y + face_height * 0.75) / height)
+                    area = (face_width * face_height) / (width * height)
+                    if previous_center is None:
+                        score = area
+                    else:
+                        distance = (
+                            (center_x - previous_center[0]) ** 2
+                            + (center_y - previous_center[1]) ** 2
+                        ) ** 0.5
+                        score = area - (distance * 0.12)
+                    candidates.append((score, center_x, center_y))
+                if not candidates:
+                    continue
+                _, center_x, center_y = max(candidates, key=lambda candidate: candidate[0])
+                previous_center = (center_x, center_y)
+                raw_track.append((timestamp - segment.start_time, center_x, center_y))
+        except Exception as error:
+            print(f"Smart reframing fallback: {error}")
+        finally:
+            capture.release()
+
+        if not raw_track:
+            return []
+        smoothed_track: List[Tuple[float, float, float]] = []
+        for index, (timestamp, _, _) in enumerate(raw_track):
+            window = raw_track[max(0, index - 1):min(len(raw_track), index + 2)]
+            smoothed_track.append((
+                timestamp,
+                float(median(point[1] for point in window)),
+                float(median(point[2] for point in window)),
+            ))
+        return smoothed_track
+
+    def _detect_subject_center(
+        self,
+        video_path: str,
+        segment: EngagingSegment,
+        sample_count: int = 12,
+    ) -> Tuple[float, float]:
+        """Estimate a stable crop focus from faces sampled across the clip."""
+        subject_track = self._detect_subject_track(video_path, segment, sample_count)
+        if not subject_track:
+            return 0.5, 0.5
+        return (
+            float(median(point[1] for point in subject_track)),
+            float(median(point[2] for point in subject_track)),
+        )
 
     def create_preview_thumbnails(self, clips_info: List[Dict[str, any]]) -> List[str]:
         """Create preview thumbnails for clips"""

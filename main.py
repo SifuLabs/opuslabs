@@ -22,6 +22,20 @@ try:
 except Exception:
     ContentStrategyBuilder = None
 
+try:
+    from src.brand_kits import BRAND_SETTING_KEYS, BrandKitStore
+except Exception:
+    BRAND_SETTING_KEYS = set()
+    BrandKitStore = None
+
+try:
+    from src.subtitle_translator import LANGUAGE_ALIASES
+    from src.transcript_tools import apply_transcript_corrections, load_transcript_corrections
+except Exception:
+    LANGUAGE_ALIASES = {}
+    apply_transcript_corrections = None
+    load_transcript_corrections = None
+
 # Load environment variables from .env file
 try:
     from dotenv import load_dotenv
@@ -40,6 +54,7 @@ class VideoEditingCopilot:
         self.moviepy_available = False
         self.ffmpeg_available = False
         self.content_strategy = ContentStrategyBuilder() if ContentStrategyBuilder else None
+        self.brand_kits = BrandKitStore() if BrandKitStore else None
         
         # Core conversation templates
         self.style_keywords = {
@@ -157,6 +172,10 @@ class VideoEditingCopilot:
         
         # Parse user preferences
         preferences = self._parse_user_preferences(user_input)
+        try:
+            preferences = self._apply_brand_kit_preferences(preferences)
+        except ValueError as error:
+            return f"❌ {error}"
         
         # Check for video file if full processing is available
         if 'full_processing' in self.available_features and not video_path:
@@ -220,6 +239,7 @@ class VideoEditingCopilot:
 
         reframe_keywords = {
             'smart': ['smart crop', 'track face', 'face tracking', 'follow speaker'],
+            'split': ['split screen', 'split-screen', 'two speaker layout', 'conversation layout'],
             'blur': ['blur background', 'blurred background', 'blur mode'],
             'crop': ['center crop', 'crop mode', 'fill frame'],
             'fit': ['fit mode', 'black bars', 'show full frame'],
@@ -239,9 +259,101 @@ class VideoEditingCopilot:
                 preferences['caption_theme'] = caption_theme
                 break
 
-        brand_match = re.search(r'\b(?:brand label|watermark)\s+["\']?([a-z0-9][a-z0-9 ._-]{1,28})', input_lower)
+        position_keywords = {
+            'top': ['captions at the top', 'captions on top', 'top captions'],
+            'middle': ['captions in the middle', 'center captions', 'middle captions'],
+            'bottom': ['captions at the bottom', 'captions on the bottom', 'bottom captions'],
+        }
+        for caption_position, keywords in position_keywords.items():
+            if any(keyword in input_lower for keyword in keywords):
+                preferences['caption_position'] = caption_position
+                break
+
+        color_match = re.search(
+            r'\bcaption(?:\s+text)?\s+colou?r\s+(#[0-9a-f]{6}|0x[0-9a-f]{6}|[a-z]+)',
+            input_lower,
+        )
+        if color_match:
+            color = color_match.group(1)
+            preferences['caption_color'] = f"0x{color[1:]}" if color.startswith('#') else color
+
+        size_match = re.search(r'\bcaption(?:\s+font)?\s+size\s+(\d{2,3})\b', input_lower)
+        if size_match:
+            preferences['caption_font_size'] = min(160, max(24, int(size_match.group(1))))
+
+        quoted_brand = re.search(
+            r'\b(?:brand label|watermark)\s+(["\'])(.{1,32}?)\1',
+            user_input,
+            flags=re.IGNORECASE,
+        )
+        brand_match = quoted_brand or re.search(
+            r'\b(?:brand label|watermark)\s+([a-z0-9][a-z0-9 ._-]{1,31})\s*$',
+            user_input,
+            flags=re.IGNORECASE,
+        )
         if brand_match:
-            preferences['brand_label'] = brand_match.group(1).strip(' ._-"\'')
+            brand_group = 2 if quoted_brand else 1
+            preferences['brand_label'] = brand_match.group(brand_group).strip(' ._-"\'')
+
+        logo_match = re.search(
+            r'\b(?:brand logo|logo)\s+(["\'])(.+?)\1',
+            user_input,
+            flags=re.IGNORECASE,
+        )
+        if logo_match:
+            preferences['brand_logo'] = logo_match.group(2).strip()
+
+        logo_position_keywords = {
+            'top-left': ['logo top left', 'logo at the top left'],
+            'top-right': ['logo top right', 'logo at the top right'],
+            'bottom-left': ['logo bottom left', 'logo at the bottom left'],
+            'bottom-right': ['logo bottom right', 'logo at the bottom right'],
+        }
+        for logo_position, keywords in logo_position_keywords.items():
+            if any(keyword in input_lower for keyword in keywords):
+                preferences['brand_logo_position'] = logo_position
+                break
+
+        brand_kit_match = re.search(
+            r'\b(use|save)\s+brand kit\s+(["\'])(.{1,48}?)\2',
+            user_input,
+            flags=re.IGNORECASE,
+        )
+        if brand_kit_match:
+            action = brand_kit_match.group(1).lower()
+            preferences[f'{action}_brand_kit'] = brand_kit_match.group(3).strip()
+
+        correction_match = re.search(
+            r'\breplace\s+(["\'])(.+?)\1\s+with\s+(["\'])(.*?)\3',
+            user_input,
+            flags=re.IGNORECASE,
+        )
+        if correction_match:
+            preferences['transcript_corrections'] = {
+                correction_match.group(2): correction_match.group(4),
+            }
+
+        correction_file_match = re.search(
+            r'\b(?:transcript corrections|corrections file)\s+(["\'])(.+?\.json)\1',
+            user_input,
+            flags=re.IGNORECASE,
+        )
+        if correction_file_match:
+            preferences['transcript_corrections_file'] = correction_file_match.group(2).strip()
+
+        if re.search(r'\b(?:subtitles?|translations?)\s+(?:in|to)\b', input_lower):
+            subtitle_languages = []
+            for language_name, language_code in LANGUAGE_ALIASES.items():
+                if re.search(rf'\b{re.escape(language_name)}\b', input_lower):
+                    subtitle_languages.append(language_code)
+            code_match = re.search(
+                r'\b(?:subtitles?|translations?)\s+(?:in|to)\s+([a-z]{2,3}(?:-[a-z0-9]{2,8})?)\b',
+                input_lower,
+            )
+            if code_match and code_match.group(1) not in subtitle_languages:
+                subtitle_languages.append(code_match.group(1))
+            if subtitle_languages:
+                preferences['subtitle_languages'] = subtitle_languages[:5]
 
         # Detect growth goal
         goal_keywords = {
@@ -272,6 +384,33 @@ class VideoEditingCopilot:
             preferences['content_type'] = 'educational'
         
         return preferences
+
+    def _apply_brand_kit_preferences(self, preferences: Dict[str, Any]) -> Dict[str, Any]:
+        """Load and optionally persist named brand controls."""
+        if not BrandKitStore:
+            return preferences
+        store = getattr(self, 'brand_kits', None) or BrandKitStore()
+        resolved = dict(preferences)
+
+        kit_name = resolved.pop('use_brand_kit', None)
+        if kit_name:
+            saved_settings = store.get(kit_name)
+            if saved_settings is None:
+                available = ', '.join(store.list_names()) or 'none'
+                raise ValueError(
+                    f'Brand kit "{kit_name}" was not found. Available kits: {available}.'
+                )
+            resolved = {**saved_settings, **resolved}
+            resolved['brand_kit'] = kit_name
+
+        save_name = resolved.pop('save_brand_kit', None)
+        if save_name:
+            store.save(
+                save_name,
+                {key: value for key, value in resolved.items() if key in BRAND_SETTING_KEYS},
+            )
+            resolved['brand_kit'] = save_name
+        return resolved
     
     def _request_video_input(self) -> Optional[str]:
         """Request video input from user"""
@@ -390,6 +529,24 @@ class VideoEditingCopilot:
             if not transcript or not transcript.get('segments'):
                 return "❌ Transcription failed — no segments found. Check FFmpeg and Whisper setup."
 
+            correction_pairs = dict(preferences.get('transcript_corrections', {}))
+            correction_path = preferences.get('transcript_corrections_file')
+            if correction_path:
+                if not load_transcript_corrections:
+                    return "❌ Transcript correction helpers are unavailable."
+                try:
+                    correction_pairs.update(load_transcript_corrections(correction_path))
+                except ValueError as error:
+                    return f"❌ {error}"
+            if correction_pairs:
+                if not apply_transcript_corrections:
+                    return "❌ Transcript correction helpers are unavailable."
+                transcript, correction_count = apply_transcript_corrections(
+                    transcript,
+                    correction_pairs,
+                )
+                print(f"✏️ Applied {correction_count} transcript corrections")
+
             duration = transcript.get('duration', 0) or transcript['segments'][-1]['end']
             seg_count = len(transcript['segments'])
             print(f"📏 Duration: {duration:.1f}s | Segments: {seg_count}")
@@ -420,7 +577,16 @@ class VideoEditingCopilot:
                 'add_captions': preferences.get('add_captions', True),
                 'reframe_mode': preferences.get('reframe_mode', 'blur'),
                 'caption_theme': preferences.get('caption_theme', 'bold'),
+                'caption_position': preferences.get('caption_position', 'bottom'),
+                'caption_color': preferences.get('caption_color', 'white'),
+                'caption_font_size': preferences.get('caption_font_size'),
                 'brand_label': preferences.get('brand_label'),
+                'brand_logo': preferences.get('brand_logo'),
+                'brand_logo_position': preferences.get('brand_logo_position', 'top-right'),
+                'brand_logo_width': preferences.get('brand_logo_width'),
+                'brand_logo_opacity': preferences.get('brand_logo_opacity', 0.9),
+                'brand_kit': preferences.get('brand_kit'),
+                'subtitle_languages': preferences.get('subtitle_languages', []),
                 'style': style,
                 'platform': preferences.get('platform', 'general'),
                 'goal': preferences.get('goal', 'engagement'),
